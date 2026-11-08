@@ -284,6 +284,16 @@ bmaas_provisioning_snat_vpc_id: 1
 # installer values. osac-installer configures the OpenShift-side resources.
 # The OCP cluster may use the virtualized `None` platform.
 ocp_evpn_required_version: "4.22"
+# Optional FRR-K8s BFD profile for OCP-to-Netris underlay peers. Leave empty
+# until BFD is enabled on the corresponding Netris BGP peer.
+ocp_evpn_bfd_profile: ""
+ocp_evpn_bfd_receive_interval_ms: 300
+ocp_evpn_bfd_transmit_interval_ms: 300
+ocp_evpn_bfd_detect_multiplier: 3
+# Use FRR's interface-based (unnumbered) BGP neighbor for the OCP underlay.
+# When enabled, the generated EVPN values omit the uplink IPv4 address and
+# peerAddress; the fabric must support unnumbered BGP on the matching port.
+ocp_evpn_bgp_unnumbered: false
 
 # The Netris underlay peer uses IPv4 unicast for PodNetwork advertisements;
 # setup-vmaas verifies the BGPSessionState after the FRR peer is configured.
