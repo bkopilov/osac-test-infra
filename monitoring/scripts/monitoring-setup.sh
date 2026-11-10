@@ -99,6 +99,7 @@ REGISTRY_LOCK_FILE="${MONITORING_HOME}/config/.remote-runners.lock"
 ###############################################################################
 phase() { echo -e "\n==> Phase $1: $2"; }
 info()  { echo "    $1"; }
+warn()  { echo "    WARNING: $1" >&2; }
 ###############################################################################
 
 usage() {
@@ -601,9 +602,23 @@ if [[ "${MODE}" == "update-central" ]]; then
     cp "${MONITORING_REPO_DIR}/scripts/ci_observe_trends.py" \
        "${MONITORING_HOME}/scripts/ci_observe_trends.py"
     chmod +x "${MONITORING_HOME}/scripts/ci_observe_trends.py"
+    # The read side of the same store: one test or one job over a window,
+    # behind /api/ci-observe/history. workflow-exporter.py imports it.
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_history.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_history.py"
     cp "${MONITORING_REPO_DIR}/scripts/ci_observe_prs.py" \
        "${MONITORING_HOME}/scripts/ci_observe_prs.py"
     chmod +x "${MONITORING_HOME}/scripts/ci_observe_prs.py"
+    # The shared phase and failure-cause vocabulary, the at-a-glance
+    # endpoints (/api/ci-observe/health, time, failures, tests, test, waits)
+    # and the span rollup the ci-observe-spans timer runs.
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_phases.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_phases.py"
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_insights.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_insights.py"
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_spans.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_spans.py"
+    chmod +x "${MONITORING_HOME}/scripts/ci_observe_spans.py"
     info "Config files + scripts updated."
 
     # The prometheus.yml copy above just brought in the repo's template
@@ -633,6 +648,10 @@ if [[ "${MODE}" == "update-central" ]]; then
        "${SYSTEMD_USER_DIR}/ci-observe-prs.service"
     cp "${MONITORING_REPO_DIR}/systemd/ci-observe-prs.timer" \
        "${SYSTEMD_USER_DIR}/ci-observe-prs.timer"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-spans.service" \
+       "${SYSTEMD_USER_DIR}/ci-observe-spans.service"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-spans.timer" \
+       "${SYSTEMD_USER_DIR}/ci-observe-spans.timer"
     # Refresh the tunnel template too (OSAC-2206 added a second -L forward
     # to it) -- this was previously never refreshed by --update-central at
     # all, so a template change would silently never reach production
@@ -671,6 +690,17 @@ if [[ "${MODE}" == "update-central" ]]; then
     systemctl --user restart service-health-textfile.timer
     systemctl --user enable --now ci-observe-trends.timer
     systemctl --user enable --now ci-observe-prs.timer
+    systemctl --user enable --now ci-observe-spans.timer
+    # Queue the rollup once now so this deploy starts a trends.db migration
+    # and the read of any run not read yet, instead of waiting for the next
+    # hourly timer. --no-block returns as soon as the unit is queued; a first
+    # backfill can take many minutes. Until it finishes the pages show the
+    # previous rollup, and the read path tolerates the old schema. A failure
+    # here only means systemd could not queue the unit; the timer retries
+    # within the hour.
+    if ! systemctl --user start --no-block ci-observe-trends.service; then
+        warn "could not queue ci-observe-trends.service; trends.db keeps its old schema until the next hourly timer run"
+    fi
 
     info "Central update complete."
     exit 0
@@ -788,13 +818,20 @@ cp "${MONITORING_REPO_DIR}/scripts/ci_observe_trends.py" \
    "${MONITORING_HOME}/scripts/ci_observe_trends.py"
 chmod +x "${MONITORING_HOME}/scripts/ci_observe_trends.py"
 info "Installed ci_observe_trends.py"
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_history.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_history.py"
+info "Installed ci_observe_history.py"
 cp "${MONITORING_REPO_DIR}/scripts/ci_observe_prs.py" \
    "${MONITORING_HOME}/scripts/ci_observe_prs.py"
 chmod +x "${MONITORING_HOME}/scripts/ci_observe_prs.py"
 info "Installed ci_observe_prs.py"
-# The workflow-exporter quadlet bind-mounts these four from
-# ${MONITORING_HOME}/scripts, and workflow-exporter.py imports three of them
-# at load. A first install must copy them or the container cannot start.
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_spans.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_spans.py"
+chmod +x "${MONITORING_HOME}/scripts/ci_observe_spans.py"
+info "Installed ci_observe_spans.py"
+# The workflow-exporter quadlet bind-mounts these from
+# ${MONITORING_HOME}/scripts, and workflow-exporter.py imports them at load.
+# A first install must copy them or the container cannot start.
 cp "${MONITORING_REPO_DIR}/scripts/workflow-exporter.py" \
    "${MONITORING_HOME}/scripts/workflow-exporter.py"
 cp "${MONITORING_REPO_DIR}/scripts/ci_observe_run_evidence.py" \
@@ -803,6 +840,12 @@ cp "${MONITORING_REPO_DIR}/scripts/ci_observe_runs.py" \
    "${MONITORING_HOME}/scripts/ci_observe_runs.py"
 cp "${MONITORING_REPO_DIR}/scripts/ci_observe_capture_view.py" \
    "${MONITORING_HOME}/scripts/ci_observe_capture_view.py"
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_history.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_history.py"
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_phases.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_phases.py"
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_insights.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_insights.py"
 info "Installed workflow-exporter and its ci-observe modules"
 
 ###############################################################################
@@ -857,6 +900,11 @@ if [[ "${MODE}" == "central" ]]; then
     cp "${MONITORING_REPO_DIR}/systemd/ci-observe-prs.timer" \
        "${SYSTEMD_USER_DIR}/ci-observe-prs.timer"
     info "Installed ci-observe-prs.service + .timer"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-spans.service" \
+       "${SYSTEMD_USER_DIR}/ci-observe-spans.service"
+    cp "${MONITORING_REPO_DIR}/systemd/ci-observe-spans.timer" \
+       "${SYSTEMD_USER_DIR}/ci-observe-spans.timer"
+    info "Installed ci-observe-spans.service + .timer"
 
     # Install the SSH tunnel template unit
     cp "${MONITORING_REPO_DIR}/systemd/monitoring-tunnel@.service" \
@@ -868,6 +916,7 @@ systemctl --user daemon-reload
 if [[ "${MODE}" == "central" ]]; then
     systemctl --user enable ci-observe-trends.timer
     systemctl --user enable ci-observe-prs.timer
+    systemctl --user enable ci-observe-spans.timer
 fi
 
 ###############################################################################
@@ -895,6 +944,7 @@ CENTRAL_SERVICES=(
     "ci-observe-tempo210.service"
     "ci-observe-trends.timer"
     "ci-observe-prs.timer"
+    "ci-observe-spans.timer"
 )
 
 for svc in "${COMMON_SERVICES[@]}"; do

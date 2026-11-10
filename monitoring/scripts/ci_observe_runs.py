@@ -1,7 +1,7 @@
 """The runs half of ci-observe: /api/ci-observe/runs, the E2E run list with a
 per-run capture verdict.
 
-The workflow exporter knows every E2E run (SQLite job history, 60 days) and,
+The workflow exporter knows every E2E run (SQLite job history, 30 days) and,
 since the capture registry landed, every capture that arrived (SQLite
 `captures`). Both answers are one SQL statement joined on the GitHub run id
 that the capture id embeds, so this endpoint never calls Tempo: its
@@ -20,7 +20,28 @@ CaptureRegistry in workflow-exporter.py); this module only reads it.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
+
+# A GitHub repository name. The filter is read-only and parameterized, but a
+# value that cannot be a repository should not silently match everything.
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+# A failed-step search text. It is matched as a substring, case-insensitively,
+# against the stored step, so keep it short and plain: letters, digits, spaces
+# and the punctuation step names use.
+FAILED_STEP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,79}$")
+
+# The suites the run table can filter on. Each suite maps to the exact
+# workflow names that belong to it (see the exporter's
+# CI_OBSERVE_SUITE_WORKFLOWS); the stored name is not a substring match, so
+# "VMaaS" cannot fold Production Install or Chart Packaging Smoke into vmaas.
+SUITES = {"core", "vmaas", "caas", "bmaas", "netris", "stretched"}
+
+# The stored conclusions the page can filter on. A timed-out run is grouped
+# into failure by CI_OBSERVE_RUN_CONCLUSION, so "failure" is its filter.
+RESULTS = {"success", "failure", "cancelled", "skipped"}
 
 # A run that ended seconds ago may still have its capture in flight: the
 # action posts telemetry after the deploy and again in verify, and the OTLP
@@ -47,8 +68,8 @@ class CIObserveRuns:
     capture registry) and the registry itself; this class applies the
     verdict."""
 
-    DEFAULT_DAYS = 7
-    MAX_DAYS = 60
+    DEFAULT_DAYS = 30
+    MAX_DAYS = 30
     DEFAULT_LIMIT = 200
     MAX_LIMIT = 2000
 
@@ -65,26 +86,66 @@ class CIObserveRuns:
     def get_json(self, params):
         """The /api/ci-observe/runs document.
 
-        Query params: days -- how many days of runs to list (default 7,
-        clamped to 1..60); limit -- how many runs to list (default 200,
+        Query params: days -- how many days of runs to list (default 30,
+        clamped to 1..30); limit -- how many runs to list (default 200,
         clamped to 1..2000); before -- the id of the last run on the previous
         page (keyset paging); run -- an exact run id, which ignores the
-        window.
+        window; repo, suite, result, failed_step -- optional filters. repo,
+        suite and failed_step narrow the rows, result filters the grouped
+        conclusion, so a run with one failed suite is not listed as a
+        success. failed_step is a case-insensitive substring of the stored
+        failed step. An unknown filter value is ignored with a note, never an
+        error.
 
         Returns days, window_from, window_to, source, runs, truncated, shown,
         total, counts, next_before and notes. shown is the number of rows on
         this page; total is how many runs match the window. Every run row
         carries capture_state ("capture", "not collected" or "unknown"),
-        capture_ids, capture_id (the first one, for a Capture link),
-        capture_reason (empty unless unknown), identity_source, started_at
-        and finished_at.
+        capture_ids, capture_id (the first one),
+        capture_reason (empty unless unknown), identity_source, started_at,
+        finished_at, pr_number (digits, for the Pull requests link) and
+        details_url (the run page, or the GitHub run when no capture exists).
+        failure_reason ("test", "infra" or "gate"), failure_area ("test",
+        "setup", "gate" or "") and failed_step (the full stored text) say why
+        a failed run has no test data. failed_step_name is the exact step the
+        first failed entry names, or "" for a pass or a cancelled run with no
+        step.
         """
         now = datetime.now(UTC)
         days = self._int_param(params, "days", self.DEFAULT_DAYS, 1, self.MAX_DAYS)
         limit = self._int_param(params, "limit", self.DEFAULT_LIMIT, 1, self.MAX_LIMIT)
         before = (params.get("before", [""])[0] or "").strip()
         run_id = (params.get("run", [""])[0] or "").strip()
+        repo = (params.get("repo", [""])[0] or "").strip()
+        suite = (params.get("suite", [""])[0] or "").strip().lower()
+        result = (params.get("result", [""])[0] or "").strip().lower()
+        failed_step = (params.get("failed_step", [""])[0] or "").strip()
         notes = []
+        # The dashboard's All option sends the literal value "all", so one
+        # variable definition always has a value to format.
+        if repo.lower() == "all":
+            repo = ""
+        if suite == "all":
+            suite = ""
+        if result == "all":
+            result = ""
+        if failed_step.lower() == "all":
+            failed_step = ""
+        if repo and not REPO_NAME_RE.match(repo):
+            notes.append(f"repository {repo!r} is not a repository name; the filter was ignored")
+            repo = ""
+        if suite and suite not in SUITES:
+            notes.append(f"suite {suite!r} is not a known suite; the filter was ignored")
+            suite = ""
+        if result and result not in RESULTS:
+            notes.append(f"result {result!r} is not a stored conclusion; the filter was ignored")
+            result = ""
+        if failed_step and not FAILED_STEP_RE.match(failed_step):
+            notes.append(
+                f"failed step {failed_step!r} is not a short plain search text; "
+                "the filter was ignored"
+            )
+            failed_step = ""
         if before and not before.isdigit():
             notes.append(
                 f"before={before!r} is not a run id; the page starts from the "
@@ -105,12 +166,16 @@ class CIObserveRuns:
             }
         else:
             page = self.exporter.get_ci_observe_run_page(
-                days=days, limit=limit, before=before, run_id=run_id
+                days=days, limit=limit, before=before, run_id=run_id,
+                repo=repo, suite=suite, result=result, failed_step=failed_step,
             )
         source = self._source(now)
         # The cards count the whole window, not the returned page. A run
         # lookup counts only the runs it returns.
-        counts = self._verdict_counts(now, days if not run_id else None, source, page["rows"])
+        counts = self._verdict_counts(
+            now, days if not run_id else None, source, page["rows"],
+            repo=repo, suite=suite, result=result, failed_step=failed_step,
+        )
         counts["returned"] = len(page["rows"])
         counts["matched"] = page["matched"]
         doc = {
@@ -150,6 +215,9 @@ class CIObserveRuns:
             finished = self._finished(run) if ended else None
             state, reason = self._state(run, ended, finished, source, now)
             capture_ids = run["capture_ids"]
+            started_at_ms = self._epoch_ms(run.get("created_at"))
+            done_at_ms = self._epoch_ms(finished) or int(now.timestamp() * 1000)
+            capture_id = capture_ids[0] if capture_ids else ""
             doc["runs"].append(
                 run | {
                     # The Capture dashboard links with an explicit window, so
@@ -162,18 +230,37 @@ class CIObserveRuns:
                     # "...Z" value is not a format its URL parser accepts, so
                     # the range would be ignored. An unfinished run still
                     # needs a `to`, and now is the honest end.
-                    "started_at_ms": self._epoch_ms(run.get("created_at")),
-                    "done_at_ms": self._epoch_ms(finished) or int(now.timestamp() * 1000),
+                    "started_at_ms": started_at_ms,
+                    "done_at_ms": done_at_ms,
                     "finished": ended,
                     "finished_at": self._iso(finished),
                     "capture_state": state,
-                    "capture_id": capture_ids[0] if capture_ids else "",
+                    "capture_id": capture_id,
                     "capture_reason": reason,
+                    # A PR cell opens the Pull requests page. The number is
+                    # stored as "#123" for display; the page wants the digits.
+                    "pr_number": str(run.get("pr") or "").lstrip("#"),
+                    # A recorded run opens the run page. A run with no
+                    # recording has no capture page, so its GitHub run is the
+                    # honest destination instead of an empty dashboard.
+                    "details_url": self._details_url(run, capture_id, started_at_ms, done_at_ms),
                 }
             )
         return doc
 
-    def _verdict_counts(self, now, days, source, rows=None):
+    @staticmethod
+    def _details_url(run, capture_id, started_at_ms, done_at_ms):
+        if not capture_id:
+            return run.get("url") or ""
+        query = f"?orgId=1&var-capture_id={quote(capture_id, safe='')}"
+        if started_at_ms and done_at_ms:
+            query += f"&from={started_at_ms}&to={done_at_ms}"
+        return "/d/ci-observe-runs/ci-observe-e28094-e2e-run" + query
+
+    def _verdict_counts(
+        self, now, days, source, rows=None, repo="", suite="", result="",
+        failed_step: str = "",
+    ):
         """{"capture": n, "not collected": n, "unknown": n} over the window.
 
         `days` is None when the caller already has the rows (a run lookup).
@@ -181,7 +268,10 @@ class CIObserveRuns:
         can never disagree about a run.
         """
         if days is not None:
-            rows = self.exporter.get_ci_observe_run_window(days=days)
+            rows = self.exporter.get_ci_observe_run_window(
+                days=days, repo=repo, suite=suite, result=result,
+                failed_step=failed_step,
+            )
         totals = {"capture": 0, "not collected": 0, "unknown": 0}
         for run in rows or []:
             ended = self._ended(run)
@@ -202,6 +292,30 @@ class CIObserveRuns:
         if registry is None:
             return {}
         return registry.capture_ids_by_run(days=days)
+
+    def verdict(self, run, now=None):
+        """("capture" | "not collected" | "unknown", reason) for one run.
+
+        The Pull requests page uses the same rules as the run list: a missing
+        capture is only 'not collected' when the registry has a complete,
+        fresh answer that covers the run. Everything else is unknown with a
+        reason, so the page never blames CI for an unproven absence.
+        """
+        now = now or datetime.now(UTC)
+        ended = self._ended(run)
+        finished = self._finished(run) if ended else None
+        return self._state(run, ended, finished, self._source(now), now)
+
+    def parse_capture_id(self, capture_id):
+        """The capture id's suite, run and attempt, or None for a junk id.
+
+        The Pull requests page needs the suite and attempt to pick its own
+        capture; the parser stays on the capture registry.
+        """
+        registry = self.registry
+        if registry is None:
+            return None
+        return registry.parse_capture_id(capture_id)
 
     # -- the verdict -------------------------------------------------------
     def _state(self, run, ended, finished, source, now):

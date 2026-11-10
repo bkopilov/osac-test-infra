@@ -39,17 +39,21 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import requests
 from helpers import FakeGitHub, FakeResponse, iso
 
+if TYPE_CHECKING:
+    from ci_observe_prs import CIObservePRs
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_observe_prs"
 DASHBOARDS_DIR = Path(__file__).resolve().parents[1] / "config" / "grafana" / "dashboards"
 DASHBOARD_FILE = DASHBOARDS_DIR / "ci-observe-pull-requests.json"
 
-NOW = datetime(2026, 11, 1, tzinfo=UTC)
-DAYS = 60
+NOW = datetime(2026, 10, 15, tzinfo=UTC)
+DAYS = 30
 REPO = "osac"
 RETENTION_START = NOW - timedelta(days=DAYS)
 REPOS_PATH = "/orgs/osac-project/repos?per_page=100&type=all"
@@ -89,7 +93,8 @@ def runs_window_path(since, until):
 
 
 class FakeAPI:
-    """The exporter-shaped API surface the backfill uses: _get and headers."""
+    """The exporter-shaped API surface the backfill uses: _get, _post (the
+    lifecycle GraphQL query) and headers."""
 
     def __init__(self, github):
         self.github = github
@@ -97,6 +102,16 @@ class FakeAPI:
 
     def _get(self, url):
         return self.github.get(url)
+
+    def _post(self, url, body):
+        return self.github.post(url, body)
+
+
+def graphql_response(graph, remaining=4990):
+    """The GraphQL answer for one pull request, as GitHub wraps it."""
+    return FakeResponse(
+        payload={"data": {"rateLimit": {"cost": 1, "remaining": remaining}, "repository": {"pullRequest": graph}}}
+    )
 
 
 def route_pr(github, fixture, number=None):
@@ -110,6 +125,8 @@ def route_pr(github, fixture, number=None):
     github.add(
         f"/repos/osac-project/{REPO}/pulls/{number}/commits?per_page=100", FakeResponse(payload=fixture["commits"])
     )
+    if "graph" in fixture:
+        github.add_graphql(REPO, number, graphql_response(fixture["graph"]))
 
 
 @pytest.fixture
@@ -132,6 +149,18 @@ def github(wfe):
         FakeResponse(payload={"total_count": 7, "workflow_runs": load_fixture("merge_group_runs")["runs"]}),
     )
     return fake
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(prs, monkeypatch):
+    """Pin the read path to NOW. `get_json` defaults to the wall clock, and a
+    test whose window depends on today would expire."""
+    original = prs.CIObservePRs.get_json
+
+    def get_json(self, params, now=None):
+        return original(self, params, NOW if now is None else now)
+
+    monkeypatch.setattr(prs.CIObservePRs, "get_json", get_json)
 
 
 @pytest.fixture
@@ -172,6 +201,44 @@ def attempts(service, number):
     return rows(service, "SELECT * FROM pr_queue_attempts WHERE number = ? ORDER BY started_at", (number,))
 
 
+def seed_jobs(service, entries, pr=101):
+    """A workflow-exporter job history next to prs.db, with the columns the
+    runs lookup reads. entries are (id, run_id, workflow, event, head_sha,
+    created_at, conclusion) tuples; everything else takes a default."""
+    db_file = Path(service.db_file).parent / "workflow-exporter.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS jobs ("
+            "id INTEGER PRIMARY KEY, repo TEXT, workflow TEXT, display_name TEXT, category TEXT,"
+            "branch TEXT, pr_url TEXT, pr_display TEXT, status TEXT, conclusion TEXT, event TEXT,"
+            "trigger TEXT, duration_s INTEGER, duration TEXT, actor TEXT, url TEXT, created_at TEXT,"
+            "updated_at TEXT, run_number INTEGER, run_attempt INTEGER, failed_step TEXT, steps_json TEXT,"
+            "failure_reason TEXT, runner_name TEXT, head_sha TEXT, run_id TEXT)"
+        )
+        for job_id, run_id, workflow, event, head_sha, created_at, conclusion in entries:
+            conn.execute(
+                "INSERT INTO jobs (id, repo, workflow, display_name, category, branch, pr_display, status,"
+                " conclusion, event, trigger, duration_s, url, created_at, updated_at, run_number,"
+                " run_attempt, failed_step, steps_json, failure_reason, runner_name, head_sha, run_id)"
+                " VALUES (?, 'osac', ?, ?, 'e2e', 'branch', ?, 'completed', ?, ?, ?, 600,"
+                " ?, ?, ?, 1, 1, '', '[]', '', 'runner-1', ?, ?)",
+                (
+                    job_id,
+                    workflow,
+                    f"osac / {workflow}",
+                    f"#{pr}",
+                    conclusion,
+                    event,
+                    event,
+                    f"https://github.com/osac-project/osac/actions/runs/{run_id}",
+                    created_at,
+                    created_at,
+                    head_sha,
+                    str(run_id),
+                ),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Parser: the three fixtures
 # ---------------------------------------------------------------------------
@@ -197,9 +264,20 @@ class TestParser:
         assert row["authoring_seconds"] == 20 * 60
         assert row["review_seconds"] == 30 * 60
         assert row["waiting_seconds"] == 10 * 60
-        assert row["queue_seconds"] == 35 * 60
+        assert row["queue_seconds"] == 34 * 60
         assert row["merged_seconds"] == 60
         assert row["total_seconds"] == 95 * 60
+
+    def test_measured_stages_sum_to_the_total(self, service: CIObservePRs) -> None:
+        """The queue ends at the last attempt and the merge starts there, so
+        the five stages account for the whole life without overlap."""
+        run_backfill(service)
+        row = pr_row(service, 101)
+        measured = sum(
+            row[key]
+            for key in ("authoring_seconds", "review_seconds", "waiting_seconds", "queue_seconds", "merged_seconds")
+        )
+        assert abs(measured - row["total_seconds"]) <= 60
 
     def test_merged_pull_request_keeps_both_attempts(self, service):
         run_backfill(service)
@@ -284,26 +362,40 @@ class TestParser:
         assert 5999 in [attempt["run_id"] for attempt in built]
         assert [attempt["run_id"] for attempt in built] == [5001, 5002, 5999]
 
-    def test_retest_count_reads_the_exporter_job_history(self, prs, github, tmp_path):
+    def test_e2e_counts_read_the_exporter_job_history(self, prs, github, tmp_path):
+        """Every E2E run of the pull request counts: the pull_request rows, the
+        merge-queue rows and the suite runs the decision starts with
+        workflow_dispatch, which name the pull request only in their run
+        name. A retest is a run beyond the first of its suite; a version is
+        a distinct commit its pull-request runs tested."""
         jobs_db = tmp_path / "workflow-exporter.db"
         with sqlite3.connect(jobs_db) as conn:
             conn.execute(
-                "CREATE TABLE jobs (id INTEGER PRIMARY KEY, repo TEXT, pr_display TEXT, category TEXT, event TEXT)"
+                "CREATE TABLE jobs (id INTEGER PRIMARY KEY, repo TEXT, pr_display TEXT, category TEXT, event TEXT,"
+                " workflow TEXT, conclusion TEXT, head_sha TEXT, failure_reason TEXT)"
             )
             conn.executemany(
-                "INSERT INTO jobs VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (1, REPO, "#101", "e2e", "pull_request"),
-                    (2, REPO, "#101", "e2e", "pull_request"),
-                    (3, REPO, "#101", "e2e", "pull_request"),
-                    (4, REPO, "#101", "e2e", "schedule"),
-                    (5, REPO, "#102", "e2e", "pull_request"),
+                    (1, REPO, "", "e2e", "workflow_dispatch", "E2E suite · vmaas · #101 · aaaaaaa", "failure",
+                     "main1", ""),
+                    (2, REPO, "", "e2e", "workflow_dispatch", "E2E suite · vmaas · #101 · bbbbbbb", "success",
+                     "main2", ""),
+                    (3, REPO, "", "e2e", "workflow_dispatch", "E2E suite · caas · #101 · bbbbbbb", "success",
+                     "main2", ""),
+                    (4, REPO, "#101", "e2e", "merge_group", "E2E vmaas (merge queue)", "success", "merge", ""),
+                    (5, REPO, "", "e2e", "workflow_dispatch", "E2E suite · vmaas · #1010 · ccccccc", "success",
+                     "main3", ""),
+                    (6, REPO, "#101", "e2e", "pull_request", "E2E caas-gate", "failure", "x", "gate"),
+                    (7, REPO, "#102", "e2e", "pull_request", "E2E VMaaS Full Install", "success", "ddd", ""),
                 ],
             )
         service = prs.CIObservePRs(db_file=str(tmp_path / "prs.db"), api=FakeAPI(github))
         run_backfill(service)
-        assert pr_row(service, 101)["retest_count"] == 2
-        assert pr_row(service, 102)["retest_count"] == 0
+        first = pr_row(service, 101)
+        assert (first["e2e_runs"], first["e2e_failures"], first["e2e_retests"], first["e2e_versions"]) == (4, 1, 2, 2)
+        assert first["retest_count"] == 2
+        assert (pr_row(service, 102)["e2e_runs"], pr_row(service, 102)["retest_count"]) == (1, 0)
 
     def test_retest_count_is_unknown_without_a_jobs_db(self, service):
         run_backfill(service)
@@ -846,9 +938,9 @@ class TestStates:
         assert "not a repository name" in doc["pr_state_message"]
         assert len(github.calls) == before
 
-    def test_outside_window(self, service, github):
+    def test_outside_window(self, prs, service, github):
         run_backfill(service, mode="full")
-        ended = iso(NOW - timedelta(days=DAYS, hours=1))
+        ended = iso(NOW - timedelta(days=prs.PRS_HISTORY_DAYS, hours=1))
         route_live_pr(github, 204, state="closed", merged_at=ended, closed_at=ended)
 
         doc = self.detail(service, 204, NOW)
@@ -957,9 +1049,40 @@ class TestEndpointDocument:
         assert first["author"] == "author3"
         assert first["url"] == "https://github.com/osac-project/osac/pull/103"
         assert first["queue_attempt_count"] == 3
-        assert first["ejected_attempt_count"] == 2
+        # One failed attempt and one cancelled one: the cancelled entry was
+        # re-queued, the pull request was not ejected for it.
+        assert first["ejected_attempt_count"] == 1
+        assert first["requeued_attempt_count"] == 1
         assert first["age_display"]
-        assert "derived, not recorded by GitHub" in doc["derivation"]["ejections"]
+        assert first["option_label"].startswith("#103 · merged · ")
+        # Removals and their reasons are GitHub's; attempt outcomes stay derived.
+        assert "removed-from-merge-queue event" in doc["derivation"]["ejections"]
+        assert "derives each attempt's outcome" in doc["derivation"]["ejections"]
+
+    def test_index_filters_by_repository(self, filled):
+        with sqlite3.connect(filled.db_file) as conn:
+            conn.execute(
+                "INSERT INTO pr_events (repo, number, title, final_stage, opened_at, fetched_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("osac-test-infra", 9, "Other repo", "merged", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"),
+            )
+
+        doc = filled.get_json({"days": [str(DAYS)], "repo": ["osac-test-infra"]})
+
+        assert [pr["number"] for pr in doc["prs"]] == [9]
+
+    def test_every_index_row_has_a_picker_label(self, filled):
+        doc = filled.get_json({"days": [str(DAYS)]})
+
+        for pr in doc["prs"]:
+            assert pr["option_label"] == f"#{pr['number']} · {pr['final_stage']} · {pr['title']}"
+
+    def test_each_stage_carries_a_display_duration(self, filled, prs):
+        doc = filled.get_json({"number": ["103"], "repo": [REPO], "days": [str(DAYS)]})
+
+        for stage in doc["stages"]:
+            assert stage["time_display"] == prs.human_duration(stage["seconds"])
+            assert stage["time_display"], stage["stage"]
 
     def test_index_age_is_the_lifetime_not_the_time_since_opened(self, filled):
         """The column says "opened to merge or close", so a pull request
@@ -993,7 +1116,7 @@ class TestEndpointDocument:
         assert funnel["review"]["samples"] == 2
         assert funnel["review"]["median_seconds"] == 1500
         assert funnel["queue"]["samples"] == 2
-        assert funnel["queue"]["median_seconds"] == 2850
+        assert funnel["queue"]["median_seconds"] == 2520
         assert funnel["merged"]["median_seconds"] == 330
 
     def test_one_pull_request_document(self, filled):
@@ -1011,7 +1134,77 @@ class TestEndpointDocument:
         assert doc["attempts"][0]["ejected"] is True
         assert doc["attempts"][0]["capture_url"] == ""
         assert doc["attempts"][0]["ejection"] == "ejected"
-        assert any("derived" in note for note in doc["notes"])
+        assert doc["attempts"][0]["started_display"] == "03 Oct 09:00"
+        assert doc["attempts"][0]["why_url"] == doc["attempts"][0]["comment_url"]
+        assert doc["attempts"][1]["why_url"] == doc["attempts"][1]["run_url"]
+        assert [attempt["queue_outcome"] for attempt in doc["attempts"]] == ["ejected", "re-queued", "passed"]
+        assert (doc["pr"]["ejected_attempt_count"], doc["pr"]["requeued_attempt_count"]) == (1, 1)
+        assert any("derives each attempt's outcome" in note for note in doc["notes"])
+
+    def test_the_summary_and_chart_name_measured_stages(self, filled: CIObservePRs) -> None:
+        doc = filled.get_json({"number": ["101"], "repo": [REPO], "days": [str(DAYS)]})
+
+        assert doc["summary"] == [
+            {"total": "1h 35m", "authoring": "20m", "review": "30m", "waiting": "10m", "queue": "34m",
+             "total_s": 5700, "authoring_s": 1200, "review_s": 1800, "waiting_s": 600, "queue_s": 2040}
+        ]
+        assert doc["chart"] == [
+            {
+                "category": "PR #101",
+                "authoring": 1200,
+                "review": 1800,
+                "waiting": 600,
+                "queue": 2040,
+                "merged": 60,
+            }
+        ]
+
+    def test_the_identity_line_links_and_dates(self, filled: CIObservePRs) -> None:
+        pr = filled.get_json({"number": ["101"], "repo": [REPO], "days": [str(DAYS)]})["pr"]
+
+        assert pr["author_url"] == "https://github.com/author1"
+        assert pr["repo_url"] == "https://github.com/osac-project/osac"
+        assert pr["dates_display"] == "Opened 01 Oct 10:00 · Merged 01 Oct 11:35"
+
+    def test_a_bot_login_goes_into_its_link_unescaped(self, filled: CIObservePRs) -> None:
+        """Grafana escapes a data link's "[" and "]" itself; an escaped login
+        would arrive as dependabot%255Bbot%255D."""
+        with sqlite3.connect(filled.db_file) as conn:
+            conn.execute("UPDATE pr_events SET author = ? WHERE number = 101", ("dependabot[bot]",))
+
+        pr = filled.get_json({"number": ["101"], "repo": [REPO], "days": [str(DAYS)]})["pr"]
+
+        assert pr["author_url"] == "https://github.com/dependabot[bot]"
+
+    def test_missing_stages_say_not_measured_and_are_absent_from_the_chart(self, filled: CIObservePRs) -> None:
+        doc = filled.get_json({"number": ["102"]})
+
+        assert doc["summary"][0]["review"] == "not measured"
+        assert doc["summary"][0]["queue"] == "not measured"
+        assert (doc["summary"][0]["review_s"], doc["summary"][0]["queue_s"]) == (None, None)
+        assert doc["chart"] == [
+            {
+                "category": "PR #102",
+                "authoring": 1800,
+                "review": None,
+                "waiting": None,
+                "queue": None,
+                "merged": None,
+            }
+        ]
+
+    def test_a_normal_stored_pull_request_has_no_status_message(self, filled: CIObservePRs) -> None:
+        seed_jobs(filled, [])
+        doc = filled.get_json({"number": ["101"], "repo": [REPO], "days": [str(DAYS)]})
+
+        assert doc["status_message"] == ""
+
+    def test_a_missing_pull_request_status_says_why(self, filled: CIObservePRs) -> None:
+        doc = filled.get_json({"number": ["999"]})
+
+        assert doc["pr"] is None
+        assert doc["status_message"]
+        assert doc["status_message"] == doc["pr_state_message"]
 
     def test_closed_pull_request_says_no_queue_history(self, filled):
         doc = filled.get_json({"number": ["102"]})
@@ -1040,7 +1233,7 @@ class TestEndpointDocument:
         assert doc["pr"] is None
 
     def test_days_are_clamped_to_the_retention(self, filled):
-        assert filled.get_json({"days": ["999"]})["days"] == 60
+        assert filled.get_json({"days": ["999"]})["days"] == 90
         assert filled.get_json({"days": ["0"]})["days"] == 1
         assert filled.get_json({"days": ["nonsense"]})["days"] == 30
 
@@ -1061,12 +1254,230 @@ class TestEndpointDocument:
         assert one["pr"] is None
         assert one["pr_state"] == "not_yet_fetched"
         assert "does not exist yet" in one["notes"][-1]
+        assert "does not exist yet" in one["status_message"]
         assert not db_file.exists(), "the read path must not create prs.db"
 
     def test_no_token_or_header_leaks(self, filled):
         body = json.dumps([filled.get_json({}), filled.get_json({"number": ["101"]})])
         assert "PRIVATE_GITHUB_TOKEN" not in body
         assert "Authorization" not in body
+
+
+# ---------------------------------------------------------------------------
+# The pull request's runs
+# ---------------------------------------------------------------------------
+class TestRuns:
+    def test_every_run_is_listed_and_each_commit_is_a_version(self, service):
+        run_backfill(service)
+        seed_jobs(
+            service,
+            [
+                (1, 9001, "E2E VMaaS Full Install", "pull_request", "a" * 40, "2026-10-01T10:00:00Z", "success"),
+                (2, 9002, "E2E vmaas (pull requests)", "pull_request", "b" * 40, "2026-10-02T10:00:00Z", "failure"),
+                (3, 9003, "E2E vmaas (merge queue)", "merge_group", "b" * 40, "2026-10-03T10:00:00Z", "success"),
+                (4, 9004, "E2E vmaas-gate", "pull_request", "c" * 40, "2026-10-04T10:00:00Z", "failure"),
+            ],
+        )
+        seed_jobs(
+            service,
+            [(5, 9005, "E2E VMaaS Full Install", "pull_request", "d" * 40, "2026-10-01T10:00:00Z", "success")],
+            pr=102,
+        )
+        doc = service.get_json({"number": ["101"]})
+
+        assert [run["run_id"] for run in doc["runs"]] == ["9003", "9002", "9001"]
+        assert [run["version"] for run in doc["runs"]] == ["", 2, 1]
+        assert [run["suite"] for run in doc["runs"]] == ["VMaaS", "VMaaS", "VMaaS"]
+        assert [run["event"] for run in doc["runs"]] == ["merge_group", "pull_request", "pull_request"]
+        # A merge-queue run tests a temporary merge commit, not the PR head:
+        # it is not a code version and has no commit link.
+        assert doc["runs"][0]["head"] == ""
+        assert doc["runs"][0]["commit_url"] == ""
+        # The gate row and another pull request's row are not e2e results.
+        assert all(run["run_id"] != "9004" for run in doc["runs"])
+        assert doc["runs"][0]["recorded"] == ""
+        assert doc["runs"][0]["run_url"] == ""
+
+    def test_a_failed_run_names_its_exact_step_and_area(self, service: CIObservePRs) -> None:
+        run_backfill(service)
+        seed_jobs(
+            service,
+            [(2, 9002, "E2E vmaas (pull requests)", "pull_request", "b" * 40, "2026-10-02T10:00:00Z", "failure")],
+        )
+        with sqlite3.connect(Path(service.db_file).parent / "workflow-exporter.db") as conn:
+            conn.execute(
+                "UPDATE jobs SET failed_step = ?, failure_reason = ? WHERE id = 2",
+                (
+                    "vmaas / e2e-vmaas-full-install / e2e → Install OSAC; "
+                    "vmaas / e2e-vmaas-full-install / test → Run E2E tests",
+                    "test",
+                ),
+            )
+        doc = service.get_json({"number": ["101"]})
+
+        # The stored area is "test", so the pytest step wins over the
+        # earlier install step even though install is the first entry.
+        assert doc["runs"][0]["failed_step_name"] == "Run E2E tests"
+        assert doc["runs"][0]["failure_area"] == "test"
+        assert doc["runs"][0]["code_display"] == "v1 · " + "b" * 12
+        assert doc["runs"][0]["created_display"] == "02 Oct 10:00"
+        assert doc["runs"][0]["status_display"] == "failure"
+        assert doc["runs"][0]["run_link"] == "https://github.com/osac-project/osac/actions/runs/9002"
+
+        # A non-test area keeps the first failed step.
+        with sqlite3.connect(Path(service.db_file).parent / "workflow-exporter.db") as conn:
+            conn.execute("UPDATE jobs SET failure_reason = 'setup' WHERE id = 2")
+        doc = service.get_json({"number": ["101"]})
+        assert doc["runs"][0]["failed_step_name"] == "Install OSAC"
+
+    def test_a_passed_run_has_no_failed_step(self, service: CIObservePRs) -> None:
+        run_backfill(service)
+        seed_jobs(
+            service,
+            [(1, 9001, "E2E VMaaS Full Install", "pull_request", "a" * 40, "2026-10-01T10:00:00Z", "success")],
+        )
+        doc = service.get_json({"number": ["101"]})
+
+        assert doc["runs"][0]["failed_step_name"] == ""
+        assert doc["runs"][0]["failure_area"] == ""
+
+    def test_a_missing_duration_is_empty_not_zero(self, service):
+        run_backfill(service)
+        seed_jobs(
+            service,
+            [(1, 9001, "E2E VMaaS Full Install", "pull_request", "a" * 40, "2026-10-01T10:00:00Z", "success")],
+        )
+        with sqlite3.connect(Path(service.db_file).parent / "workflow-exporter.db") as conn:
+            conn.execute("UPDATE jobs SET duration_s = NULL WHERE id = 1")
+        doc = service.get_json({"number": ["101"]})
+        assert doc["runs"][0]["duration_s"] is None
+        assert doc["runs"][0]["duration_display"] == ""
+
+    def test_a_pull_request_without_runs_says_why(self, service):
+        run_backfill(service)
+        seed_jobs(service, [])
+        doc = service.get_json({"number": ["102"]})
+        assert doc["runs"] == []
+        assert "no E2E run" in doc["notes"][-1]
+
+    def test_an_open_pull_request_is_read_from_github_with_stages_and_queue_runs(self, service, github):
+        run_backfill(service)
+        fixture = load_fixture("merged_pr")
+        open_pr = dict(fixture["pr"])
+        open_pr.update({"number": 777, "state": "open", "merged_at": None, "closed_at": None})
+        github.add(f"/repos/osac-project/{REPO}/pulls/777", FakeResponse(payload=open_pr))
+        route_pr(github, {**fixture, "pr": open_pr}, number=777)
+        seed_jobs(
+            service,
+            [
+                (11, 9101, "E2E vmaas (pull requests)", "pull_request", "a" * 40, "2026-10-05T10:00:00Z", "success"),
+                (12, 9102, "E2E vmaas (merge queue)", "merge_group", "b" * 40, "2026-10-06T11:00:00Z", "failure"),
+                (13, 9103, "E2E caas (merge queue)", "merge_group", "b" * 40, "2026-10-06T11:05:00Z", "success"),
+            ],
+            pr=777,
+        )
+
+        doc = service.get_json({"number": ["777"], "repo": [REPO]})
+
+        assert doc["source"] == "live", (doc.get("pr_state_message"), doc.get("notes"))
+        assert doc["pr_state"] == "open"
+        assert doc["pr"]["state"] == "open"
+        assert doc["pr"]["merged_at"] is None
+        # The review history produces the same stages the backfill stores.
+        assert [stage["stage"] for stage in doc["stages"]] == [
+            "authoring", "review", "waiting", "queue", "merged"
+        ]
+        assert doc["stages"][1]["state"] == "measured"
+        assert doc["pr"]["queued_at"] == "2026-10-06T11:00:00Z"
+        assert doc["pr"]["final_stage"] == "open in queue"
+        # Queue time runs to the live as-of moment while the pull request is
+        # still queued. The stage, the stat and the bar all end there.
+        assert doc["pr"]["as_of"] == "2026-10-15T00:00:00Z"
+        assert doc["stages"][3]["state"] == "measured"
+        assert doc["stages"][3]["end_at"] == "2026-10-15T00:00:00Z"
+        assert doc["stages"][3]["seconds"] > 0
+        assert doc["summary"][0]["queue"] == doc["stages"][3]["time_display"]
+        assert doc["chart"][0]["queue"] == round(doc["stages"][3]["seconds"])
+        assert doc["stages"][4]["state"] == "not_reached"
+        assert len(doc["runs"]) == 3
+        # The queue history comes from the stored merge_group runs. The two
+        # workflows of one queue entry share a branch and commit, so they are
+        # one attempt; the failed workflow marks it ejected.
+        assert len(doc["attempts"]) == 1
+        assert doc["attempts"][0]["run_ids"] == ["9102", "9103"]
+        assert doc["attempts"][0]["run_count"] == 2
+        assert doc["attempts"][0]["run_id"] == 9102
+        assert doc["attempts"][0]["ejected"] is True
+        assert doc["attempts"][0]["ejection_kind"] == "check_failed"
+
+    def test_an_approved_pull_request_not_in_the_queue_ends_waiting_at_as_of(
+        self, service: CIObservePRs, github: FakeGitHub
+    ) -> None:
+        run_backfill(service)
+        fixture = load_fixture("merged_pr")
+        open_pr = dict(fixture["pr"])
+        open_pr.update({"number": 778, "state": "open", "merged_at": None, "closed_at": None})
+        github.add(f"/repos/osac-project/{REPO}/pulls/778", FakeResponse(payload=open_pr))
+        route_pr(github, {**fixture, "pr": open_pr}, number=778)
+        seed_jobs(
+            service,
+            [(21, 9201, "E2E vmaas (pull requests)", "pull_request", "a" * 40, "2026-10-05T10:00:00Z", "success")],
+            pr=778,
+        )
+
+        doc = service.get_json({"number": ["778"], "repo": [REPO]})
+
+        waiting = next(stage for stage in doc["stages"] if stage["stage"] == "waiting")
+        queue = next(stage for stage in doc["stages"] if stage["stage"] == "queue")
+        assert doc["pr"]["as_of"] == "2026-10-15T00:00:00Z"
+        assert waiting["state"] == "measured"
+        assert waiting["end_at"] == "2026-10-15T00:00:00Z"
+        assert waiting["seconds"] > 0
+        assert queue["state"] == "not_reached"
+        assert doc["summary"][0]["waiting"] == waiting["time_display"]
+        assert doc["chart"][0]["waiting"] == round(waiting["seconds"])
+
+    def test_an_unreadable_review_history_does_not_invent_stages(self, service, github):
+        run_backfill(service)
+        fixture = load_fixture("merged_pr")
+        open_pr = dict(fixture["pr"])
+        open_pr.update({"number": 888, "state": "open", "merged_at": None, "closed_at": None})
+        # The pull request itself is readable; its timeline is not routed.
+        github.add(f"/repos/osac-project/{REPO}/pulls/888", FakeResponse(payload=open_pr))
+
+        doc = service.get_json({"number": ["888"], "repo": [REPO]})
+
+        assert doc["source"] == "live"
+        assert doc["pr"]["state"] == "open"
+        # An unreadable history is missing, not "never reviewed".
+        assert doc["stages"] == []
+        assert any("review history could not be read" in note for note in doc["notes"])
+        assert "review history could not be read" in doc["status_message"]
+
+    def test_a_live_merged_pull_request_measures_its_merge_segment(
+        self, service: CIObservePRs, github: FakeGitHub
+    ) -> None:
+        run_backfill(service)
+        fixture = load_fixture("merged_pr")
+        merged_pr = dict(fixture["pr"])
+        merged_pr.update({"number": 779, "state": "closed", "created_at": "2026-10-06T10:00:00Z"})
+        merged_pr.update({"merged_at": "2026-10-06T12:00:00Z", "closed_at": "2026-10-06T12:00:00Z"})
+        github.add(f"/repos/osac-project/{REPO}/pulls/779", FakeResponse(payload=merged_pr))
+        route_pr(github, {**fixture, "pr": merged_pr}, number=779)
+        seed_jobs(
+            service,
+            [(31, 9301, "E2E vmaas (merge queue)", "merge_group", "b" * 40, "2026-10-06T11:00:00Z", "success")],
+            pr=779,
+        )
+
+        doc = service.get_json({"number": ["779"], "repo": [REPO]})
+
+        merged = next(stage for stage in doc["stages"] if stage["stage"] == "merged")
+        assert doc["pr"]["state"] == "merged"
+        assert doc["pr"]["merged_seconds"] == 3600
+        assert merged["state"] == "measured"
+        assert merged["end_at"] == "2026-10-06T12:00:00Z"
+        assert doc["chart"][0]["merged"] == 3600
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1540,56 @@ class TestHTTP:
         assert "var-capture_id=caas-pr103-5101-a1" in attempt["capture_url"]
         assert attempt["capture_url"].startswith("/d/ci-observe-runs/")
 
+    def test_a_run_links_to_its_own_suite_capture_or_unknown(self, base_url, service):
+        """One pull-request-flow run holds a capture per suite, and a missing
+        capture is only a proven absence when the registry can judge it."""
+        run_backfill(service)
+        seed_jobs(
+            service,
+            [
+                (1, 9201, "E2E VMaaS Full Install", "pull_request", "a" * 40, "2026-10-01T10:00:00Z", "success"),
+                (2, 9202, "E2E VMaaS Full Install", "pull_request", "b" * 40, "2026-10-02T10:00:00Z", "failure"),
+                (3, 9203, "E2E vmaas (pull requests)", "pull_request", "c" * 40, "2026-10-03T10:00:00Z", "success"),
+                (4, 9203, "E2E caas (pull requests)", "pull_request", "c" * 40, "2026-10-03T10:00:00Z", "success"),
+            ],
+        )
+
+        class FakeRuns:
+            def capture_ids_by_run(self):
+                return {
+                    "9201": ["vmaas-pr101-9201-a1"],
+                    "9203": ["caas-pr101-9203-a1", "vmaas-pr101-9203-a1"],
+                }
+
+            @staticmethod
+            def parse_capture_id(capture_id):
+                suite = capture_id.split("-pr")[0].split("-main")[0]
+                return {"suite": suite, "run_attempt": capture_id.rsplit("-a", 1)[1]}
+
+            def verdict(self, run, now=None):
+                if run["capture_ids"]:
+                    return "capture", ""
+                return "unknown", "the capture registry has no complete answer yet"
+
+        service._runs = FakeRuns()
+        status, _, body = self.get(f"{base_url}/api/ci-observe/prs?number=101&repo=osac")
+
+        assert status == 200
+        runs = json.loads(body)["runs"]
+        by_run = {run["run_id"]: run for run in runs}
+        assert by_run["9201"]["capture_id"] == "vmaas-pr101-9201-a1"
+        assert by_run["9201"]["recorded"] == "yes"
+        assert "var-capture_id=vmaas-pr101-9201-a1" in by_run["9201"]["run_url"]
+        # No capture and a registry that cannot judge: unknown, not "No".
+        assert by_run["9202"]["recorded"] == "unknown"
+        assert by_run["9202"]["recorded_reason"]
+        assert by_run["9202"]["run_url"] == ""
+        # Two suites of one run each link to their own capture.
+        vmaas_row = next(run for run in runs if run["run_id"] == "9203" and run["suite_key"] == "vmaas")
+        caas_row = next(run for run in runs if run["run_id"] == "9203" and run["suite_key"] == "caas")
+        assert vmaas_row["capture_id"] == "vmaas-pr101-9203-a1"
+        assert caas_row["capture_id"] == "caas-pr101-9203-a1"
+
 
 # ---------------------------------------------------------------------------
 # Dashboard contract: the real response resolves what the dashboard queries
@@ -1149,6 +1610,12 @@ def test_dashboard_selectors_resolve_against_the_real_response(service):
     """Every root_selector and column the dashboard asks for must exist in
     the real endpoint response, so the two cannot drift apart."""
     run_backfill(service)
+    seed_jobs(
+        service,
+        [
+            (1, 9001, "E2E VMaaS Full Install", "pull_request", "a" * 40, "2026-10-01T10:00:00Z", "success"),
+        ],
+    )
     dashboard = json.loads(DASHBOARD_FILE.read_text())
     documents = {
         "index": service.get_json({"days": [str(DAYS)]}),
@@ -1158,23 +1625,28 @@ def test_dashboard_selectors_resolve_against_the_real_response(service):
     checked = 0
     for panel in iter_panels(dashboard["panels"]):
         for target in panel.get("targets", []):
-            doc = documents["index"] if "days=" in target["url"] else documents["pr"]
+            doc = documents["pr"] if "number=" in target["url"] else documents["index"]
             selector = target["root_selector"]
             if selector == "$":
-                continue
-            if selector.startswith("$."):
-                selector = selector[2:]
-            node = doc
-            for part in selector.split("."):
-                node = node[part]
-            assert node, f"{panel['title']}: {target['root_selector']} is empty"
-            sample = node[0] if isinstance(node, list) else node
+                sample = doc
+            else:
+                if selector.startswith("$."):
+                    selector = selector[2:]
+                node = doc
+                for part in selector.split("."):
+                    node = node[part]
+                if not node and selector.startswith("scatter_"):
+                    # A working-group group with no pull request is empty;
+                    # every group's rows have one shape, so check another.
+                    node = next(doc[key] for key in doc if key.startswith("scatter_") and doc[key])
+                assert node, f"{panel['title']}: {target['root_selector']} is empty"
+                sample = node[0] if isinstance(node, list) else node
             for column in target["columns"]:
                 assert column["selector"] in sample, (
                     f"{panel['title']}: column {column['selector']} is not in the endpoint response"
                 )
             checked += 1
-    assert checked >= 5
+    assert checked >= 9, "the page has an identity row, five tiles, a chart and three tables"
 
 
 def test_backfill_is_mounted_in_the_exporter_and_scheduled_hourly():
@@ -1186,7 +1658,7 @@ def test_backfill_is_mounted_in_the_exporter_and_scheduled_hourly():
     assert "ci_observe_prs.py:/app/ci_observe_prs.py" in quadlet
 
     service = (monitoring / "systemd" / "ci-observe-prs.service").read_text()
-    assert "podman exec workflow-exporter python3 /app/ci_observe_prs.py --days 60 --mode auto" in service
+    assert "podman exec workflow-exporter python3 /app/ci_observe_prs.py --days 90 --mode auto" in service
 
     timer = (monitoring / "systemd" / "ci-observe-prs.timer").read_text()
     assert "OnCalendar=*-*-* *:05:00" in timer
@@ -1198,3 +1670,756 @@ def test_backfill_is_mounted_in_the_exporter_and_scheduled_hourly():
     assert "systemd/ci-observe-prs.timer" in setup
     assert "systemctl --user enable --now ci-observe-prs.timer" in setup
     assert "systemctl --user enable ci-observe-prs.timer" in setup
+
+
+# ---------------------------------------------------------------------------
+# The second record format: rebases, review rounds, readiness, E2E counts,
+# and the window's headline numbers
+# ---------------------------------------------------------------------------
+class TestRecordFormat:
+    def test_rebases_reviews_and_readiness_are_stored(self, prs, github, service):
+        fixture = load_fixture("merged_pr")
+        timeline = [
+            *fixture["timeline"],
+            {"event": "head_ref_force_pushed", "created_at": "2026-10-01T10:30:00Z"},
+            {"event": "head_ref_force_pushed", "created_at": "2026-10-01T10:40:00Z"},
+            {"event": "ready_for_review", "created_at": "2026-10-01T10:10:00Z"},
+        ]
+        reviews = [
+            *fixture["reviews"],
+            {"state": "CHANGES_REQUESTED", "user": {"login": "reviewer2", "type": "User"},
+             "submitted_at": "2026-10-01T10:25:00Z"},
+        ]
+        github.add(f"/repos/osac-project/{REPO}/issues/101/timeline?per_page=100", FakeResponse(payload=timeline))
+        github.add(f"/repos/osac-project/{REPO}/pulls/101/reviews?per_page=100", FakeResponse(payload=reviews))
+        run_backfill(service)
+        row = pr_row(service, 101)
+        assert row["force_push_count"] == 2
+        assert row["changes_requested_count"] == 1
+        assert row["human_review_count"] == 3
+        assert row["ready_at"] == "2026-10-01T10:10:00Z"
+        assert row["review_wait_seconds"] == 600, "ready at 10:10, first human review at 10:20"
+        assert row["record_version"] == prs.RECORD_VERSION
+
+    def test_a_pull_request_that_was_never_a_draft_is_ready_when_opened(self, service):
+        run_backfill(service)
+        row = pr_row(service, 101)
+        assert row["ready_at"] == row["opened_at"]
+        assert row["force_push_count"] == 0
+
+    def test_a_row_of_the_older_format_is_refetched_a_bounded_number_per_pass(self, prs, service, github,
+                                                                               monkeypatch):
+        # A pass that refetches one pull request asks for the merge-group
+        # runs from that pull request's creation.
+        for name in ("merged_pr", "ejected_pr", "closed_pr"):
+            created = datetime.fromisoformat(load_fixture(name)["pr"]["created_at"].replace("Z", "+00:00"))
+            github.add(runs_window_path(created, NOW), FakeResponse(
+                payload={"total_count": 7, "workflow_runs": load_fixture("merge_group_runs")["runs"]}))
+        run_backfill(service)
+        with sqlite3.connect(service.db_file) as conn:
+            conn.execute("UPDATE pr_events SET record_version = NULL, force_push_count = NULL")
+        monkeypatch.setattr(prs, "LEGACY_REFRESH_PER_PASS", 1)
+        summary = run_backfill(service)
+        assert summary["prs_stored"] == 1
+        assert summary["prs_skipped"] == 2
+        summary = run_backfill(service)
+        assert summary["prs_stored"] == 1
+        upgraded = rows(service, "SELECT number FROM pr_events WHERE record_version = ?", (prs.RECORD_VERSION,))
+        assert len(upgraded) == 2
+
+
+class TestIndexNumbers:
+    def test_the_index_carries_kpis_and_a_weekly_trend(self, service):
+        run_backfill(service)
+        doc = service.get_json({"days": ["30"]})
+        kpis = doc["kpis"][0]
+        assert kpis["prs"] == 3
+        assert kpis["merged"] == 2
+        assert kpis["closed"] == 1
+        assert kpis["lead_median_s"] is not None
+        assert kpis["queued_share"] is not None
+        assert kpis["measured_prs"] == 2
+        assert doc["weekly"], "the merged pull requests fall in at least one week"
+        assert all(week["week"] <= NOW.strftime("%Y-%m-%d") for week in doc["weekly"])
+        assert sum(week["merged"] for week in doc["weekly"]) == 2
+        assert all(row["detail_url"].startswith("/d/ci-observe-pull-requests/") for row in doc["prs"])
+
+    def test_an_empty_window_measures_nothing(self, prs):
+        kpis = prs._kpis([], {})[0]
+        assert kpis["merged"] == 0
+        assert kpis["lead_median_s"] is None
+        assert kpis["rebased_share"] is None
+        assert kpis["e2e_retests_mean"] is None
+        assert prs._weekly([]) == []
+
+    def test_the_e2e_numbers_describe_the_pull_requests_that_ran_e2e(self, prs):
+        """Most pull requests run no suite: a median over all of them is 0."""
+        def merged(number, runs, retests, failures):
+            return {"repo": "osac", "number": number, "state": "merged", "total_seconds": 3600, "record_version": 2,
+                    "e2e_runs": runs, "e2e_retests": retests, "e2e_failures": failures,
+                    "merged_at": "2026-10-05T10:00:00Z"}
+
+        rows_ = [merged(1, 0, 0, 0), merged(2, 0, 0, 0), merged(3, 0, 0, 0), merged(4, 3, 0, 0),
+                 merged(5, 9, 6, 2), merged(6, None, None, None)]
+        kpis = prs._kpis(rows_, {})[0]
+
+        assert kpis["e2e_ran_share"] == 0.4
+        assert kpis["e2e_runs_median"] == 6
+        assert kpis["e2e_retests_median"] == 3
+        assert kpis["e2e_failed_share"] == 0.5
+
+    def test_kpis_use_measured_rows_only_for_the_new_counts(self, prs):
+        rows_ = [
+            {"repo": "osac", "number": 1, "state": "merged", "total_seconds": 3600, "record_version": 2,
+             "force_push_count": 2, "e2e_runs": 3, "e2e_retests": 1, "e2e_failures": 1,
+             "changes_requested_count": 0, "merged_at": "2026-10-05T10:00:00Z"},
+            {"repo": "osac", "number": 2, "state": "merged", "total_seconds": 7200, "record_version": None,
+             "force_push_count": None, "merged_at": "2026-10-06T10:00:00Z"},
+        ]
+        attempts_ = {("osac", 1): [{"ejected": 1, "conclusion": "failure"}, {"ejected": 1, "conclusion": "cancelled"},
+                                   {"ejected": 0, "conclusion": "success"}]}
+        kpis = prs._kpis(rows_, attempts_)[0]
+        assert kpis["rebased_share"] == 1.0
+        assert kpis["force_pushes_mean"] == 2.0
+        assert kpis["e2e_retests_mean"] == 1.0
+        assert kpis["e2e_failed_share"] == 1.0
+        assert kpis["ejected_share"] == 1.0
+        assert kpis["ejections"] == 1
+        assert kpis["requeues"] == 1
+        assert kpis["queued_share"] == 0.5
+        assert kpis["measured_prs"] == 1
+        weekly = prs._weekly(rows_)
+        assert [week["week"] for week in weekly] == ["2026-10-05"]
+        assert weekly[0]["merged"] == 2
+
+
+@pytest.mark.parametrize(
+    ("attempt", "outcome"),
+    [
+        ({"ejected": 0, "conclusion": "success"}, "passed"),
+        ({"ejected": 1, "conclusion": "failure", "ejection_kind": "check_failed"}, "ejected"),
+        ({"ejected": 1, "conclusion": "timed_out", "ejection_kind": "timed_out"}, "ejected"),
+        ({"ejected": 1, "conclusion": "startup_failure"}, "ejected"),
+        # Every entry behind a failing one is cancelled and queued again.
+        ({"ejected": 1, "conclusion": "cancelled", "ejection_kind": "cancelled",
+          "ejection_reason": "merge_group entry (run 5102) concluded cancelled"}, "requeued"),
+        # GitHub cancels an entry that ran past the queue's time limit.
+        ({"ejected": 1, "conclusion": "cancelled", "ejection_kind": "cancelled",
+          "ejection_reason": "removed from the merge queue: the required checks timed out"}, "ejected"),
+        # A passed entry that a later attempt replaced.
+        ({"ejected": 1, "conclusion": "success", "ejection_kind": "unknown"}, "requeued"),
+    ],
+)
+def test_queue_outcome(prs, attempt, outcome):
+    assert prs.queue_outcome(attempt) == outcome
+
+
+def test_a_pull_request_suite_run_appears_with_the_commit_it_tested(prs, service):
+    """The decision starts a pull request's suite with workflow_dispatch from
+    the default branch: the row names the pull request and the commit only
+    in its run name."""
+    run_backfill(service)
+    seed_jobs(service, [
+        (900, 900, "E2E suite · vmaas · #101 · 0123456789abcdef0123456789abcdef01234567", "workflow_dispatch",
+         "mainsha", iso(NOW - timedelta(days=2)), "success"),
+    ], pr="")
+    doc = service.get_json({"number": ["101"], "repo": [REPO], "days": ["30"]})
+    assert [run["run_id"] for run in doc["runs"]] == ["900"]
+    assert doc["runs"][0]["head"] == "0123456789ab"
+    assert doc["runs"][0]["code_display"].startswith("v1 · 0123456789ab")
+
+
+class TestE2EHistory:
+    """A pull request's E2E counts come from the exporter's 30 days of jobs
+    and the 90-day run archive in trends.db, and say "not measured" when
+    the stores start after the pull request was opened."""
+
+    def archive(self, service, rows):
+        trends_db = Path(service.db_file).parent / "trends.db"
+        with sqlite3.connect(trends_db) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS suite_runs (id INTEGER PRIMARY KEY, run_id TEXT, repo TEXT,"
+                " workflow TEXT, conclusion TEXT, event TEXT, created_at TEXT, pr_display TEXT, head_sha TEXT,"
+                " failure_reason TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO suite_runs (id, run_id, repo, workflow, conclusion, event, created_at, pr_display,"
+                " head_sha, failure_reason) VALUES (?, ?, 'osac', ?, ?, ?, ?, '#101', ?, '')",
+                rows,
+            )
+
+    def test_runs_older_than_the_exporter_window_come_from_the_archive(self, service):
+        opened = iso(NOW - timedelta(days=50))
+        seed_jobs(service, [
+            (1, 1, "E2E VMaaS Full Install", "workflow_dispatch", "a" * 40, iso(NOW - timedelta(days=20)),
+             "success"),
+        ])
+        self.archive(service, [
+            (1, "1", "E2E VMaaS Full Install", "success", "workflow_dispatch", iso(NOW - timedelta(days=20)), "a" * 40),
+            (2, "2", "E2E VMaaS Full Install", "failure", "workflow_dispatch", iso(NOW - timedelta(days=45)), "b" * 40),
+            (3, "3", "E2E CaaS Full Install", "success", "workflow_dispatch", iso(NOW - timedelta(days=60)), "b" * 40),
+        ])
+        stats = service._e2e_stats("osac", 101, opened_at=opened)
+        assert stats == {"runs": 3, "failures": 1, "retests": 1, "versions": 2}, "a job in both stores counts once"
+
+    def test_a_pull_request_opened_before_the_stores_begin_is_not_measured(self, service):
+        seed_jobs(service, [
+            (1, 1, "E2E VMaaS Full Install", "workflow_dispatch", "a" * 40, iso(NOW - timedelta(days=20)),
+             "success"),
+        ])
+        stats = service._e2e_stats("osac", 101, opened_at=iso(NOW - timedelta(days=40)))
+        assert stats == {"runs": None, "failures": None, "retests": None, "versions": None}
+
+    def test_no_store_is_not_measured(self, service):
+        assert service._e2e_stats("osac", 101)["runs"] is None
+
+    def test_only_the_three_suites_count(self, service):
+        seed_jobs(service, [
+            (1, 1, "E2E VMaaS Full Install", "workflow_dispatch", "a" * 40, iso(NOW - timedelta(days=2)), "success"),
+            (2, 2, "E2E VMaaS Netris Full Install", "workflow_dispatch", "a" * 40, iso(NOW - timedelta(days=2)),
+             "failure"),
+        ])
+        stats = service._e2e_stats("osac", 101)
+        assert (stats["runs"], stats["failures"]) == (1, 0), "Netris is another scenario"
+
+
+def test_the_overview_asks_for_both_repositories(service):
+    run_backfill(service)
+    both = service.get_json({"days": ["30"], "repo": ["all"]})
+    assert both["kpis"] == service.get_json({"days": ["30"]})["kpis"]
+    assert both["kpis"][0]["prs"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: the events, the states, the working groups
+# ---------------------------------------------------------------------------
+LIFECYCLE = "lifecycle_pr"
+
+
+def lifecycle_of(prs, name=LIFECYCLE, graph=True, attempts=()):
+    fixture = load_fixture(name)
+    return prs.lifecycle_events(fixture["pr"], fixture["timeline"], fixture["reviews"], fixture["commits"],
+                                fixture["graph"] if graph else None, list(attempts))
+
+
+def at(clock, day="2026-10-05"):
+    return f"{day}T{clock}:00Z"
+
+
+def event(clock, kind, **fields):
+    return {"at": at(clock), "kind": kind, "actor": fields.pop("actor", ""), "detail": "", "url": "", **fields}
+
+
+def states(segments):
+    return [(segment["state"], segment["start"][11:16], segment["end"][11:16]) for segment in segments]
+
+
+@pytest.fixture
+def lifecycle_github(wfe):
+    """GitHub with one pull request, #104, and its whole story."""
+    fake = FakeGitHub(wfe.API_URL)
+    fixture = load_fixture(LIFECYCLE)
+    route_pr(fake, fixture)
+    fake.add(REPOS_PATH, FakeResponse(payload=[{"name": REPO}]))
+    fake.add(PULLS_PATH, FakeResponse(payload=[fixture["pr"]]))
+    created = datetime.fromisoformat(fixture["pr"]["created_at"].replace("Z", "+00:00"))
+    fake.add(runs_window_path(created, NOW), FakeResponse(payload={"total_count": 0, "workflow_runs": []}))
+    return fake
+
+
+@pytest.fixture
+def lifecycle_service(prs, lifecycle_github, tmp_path):
+    prs._LIVE_PR_CACHE.clear()
+    return prs.CIObservePRs(db_file=str(tmp_path / "prs.db"), api=FakeAPI(lifecycle_github))
+
+
+class TestLifecycle:
+    def test_the_events_tell_the_story_in_order(self, prs):
+        events = lifecycle_of(prs)
+        assert [(item["at"][11:16], item["kind"]) for item in events] == [
+            ("08:00", "opened"), ("09:00", "ready"), ("09:00", "review_requested"), ("09:00", "review_requested"),
+            ("10:00", "review"), ("11:00", "review"), ("13:00", "review"), ("13:05", "auto_merge_on"),
+            ("13:05", "queued"), ("13:50", "dequeued"), ("14:30", "force_push"), ("14:30", "dismissed"),
+            ("14:30", "dismissed"), ("15:00", "review"), ("15:05", "merge_commit"), ("15:10", "review"),
+            ("15:12", "auto_merge_on"), ("15:12", "queued"), ("16:00", "merged"),
+        ]
+        assert events[0]["draft"] is True, "the first draft event is ready_for_review: it opened as a draft"
+        assert "author4" not in [item["actor"] for item in events if item["kind"] == "review"], (
+            "the author's reply in a review thread is not a review"
+        )
+        force_push = next(item for item in events if item["kind"] == "force_push")
+        assert force_push["detail"] == "to f00d123, 2 commits", "the rebased commits fold into their push"
+        assert not [item for item in events if item["kind"] == "commit"]
+        removed = next(item for item in events if item["kind"] == "dequeued")
+        assert (removed["detail"], removed["reason"], removed["source"]) == ("failed checks", "FAILED_CHECKS", "github")
+        dismissed = [item for item in events if item["kind"] == "dismissed"]
+        assert [item["detail"] for item in dismissed] == ["rev-vm's review", "rev-caas's review"]
+        assert {item["state"] for item in dismissed} == {"APPROVED"}, "the dismissal keeps what the review was"
+        approvals = [item for item in events if item["kind"] == "review" and item["state"] == "APPROVED"]
+        assert [item["teams"] for item in approvals] == [
+            ["wg-vmaas"], ["maintainers", "wg-caas"], ["wg-vmaas"], ["maintainers", "wg-caas"],
+        ], "GitHub left the later approvals without onBehalfOf; the reviewers' teams still count them"
+        assert approvals[1]["detail"] == "for wg-caas, maintainers"
+
+    def test_the_states_follow_the_events(self, prs):
+        fixture = load_fixture(LIFECYCLE)
+        segments, _ = prs.lifecycle_from_events(
+            lifecycle_of(prs), fixture["pr"]["merged_at"], prs.required_teams(fixture["graph"])
+        )
+        assert states(segments) == [
+            ("draft", "08:00", "09:00"),
+            ("waiting_review", "09:00", "10:00"),
+            ("with_author", "10:00", "11:00"),
+            # wg-vmaas approved; wg-caas had not.
+            ("partly_approved", "11:00", "13:00"),
+            ("approved", "13:00", "13:05"),
+            ("in_queue", "13:05", "13:50"),
+            ("out_of_queue", "13:50", "14:30"),
+            # The rebase dismissed both approvals.
+            ("waiting_review", "14:30", "15:00"),
+            ("partly_approved", "15:00", "15:10"),
+            ("approved", "15:10", "15:12"),
+            ("in_queue", "15:12", "16:00"),
+        ]
+        assert sum(segment["seconds"] for segment in segments) == 8 * 3600, "every moment, once"
+        assert prs.lifecycle_seconds(segments) == {
+            "draft": 3600, "waiting_review": 5400, "with_author": 3600, "partly_approved": 7800,
+            "approved": 420, "in_queue": 5580, "out_of_queue": 2400,
+        }
+
+    def test_the_numbers_of_the_story(self, prs):
+        _, facts = prs.lifecycle_from_events(lifecycle_of(prs), at("16:00"), {"wg-vmaas", "wg-caas"})
+        assert facts == {
+            # aaa, bbb, ccc, ddd and eee each got a review.
+            "review_rounds": 5,
+            "approval_count": 4,
+            "reapprovals": 2,
+            "rebase_rereviews": 2,
+            # rev-vm re-approved 30 minutes after the rebase; rev-caas 5
+            # minutes after "Update branch". The longest counts.
+            "rereview_seconds": 1800,
+            "approvals_dismissed": 2,
+            "merge_commits": 1,
+            "force_pushes": 1,
+            "pushes": 2,
+            "last_approval_at": at("13:00"),
+            "enqueued_at": at("13:05"),
+            "queue_entries": 2,
+            "queue_removals": 1,
+            "removal_reasons": ["failed checks"],
+            "auto_merge": 1,
+        }
+
+    def test_one_approval_is_enough_when_no_working_group_is_named(self, prs):
+        for required in (set(), None):
+            segments, _ = prs.lifecycle_from_events(lifecycle_of(prs), at("16:00"), required)
+            assert "partly_approved" not in {segment["state"] for segment in segments}, required
+            assert states(segments)[3] == ("approved", "11:00", "13:05")
+
+    def test_a_change_request_holds_until_its_reviewer_approves(self, prs):
+        events = [
+            event("10:00", "opened"),
+            event("11:00", "review", actor="r1", state="CHANGES_REQUESTED", review_id=1),
+            event("12:00", "commit"),
+            event("13:00", "review", actor="r2", state="APPROVED", review_id=2),
+            event("14:00", "review", actor="r1", state="APPROVED", review_id=3),
+            event("15:00", "merged"),
+        ]
+        segments, _ = prs.lifecycle_from_events(events, at("15:00"))
+        assert states(segments) == [
+            ("waiting_review", "10:00", "11:00"),
+            ("with_author", "11:00", "12:00"),
+            ("waiting_review", "12:00", "14:00"),
+            ("approved", "14:00", "15:00"),
+        ]
+
+    def test_a_push_after_the_approval_is_a_re_review_only_when_an_approval_follows(self, prs):
+        base = [
+            event("10:00", "opened"),
+            event("11:00", "review", actor="r1", state="APPROVED", review_id=1),
+            event("12:00", "commit"),
+        ]
+        kept, _ = prs.lifecycle_from_events(
+            [*base, event("13:00", "queued"), event("14:00", "merged")], at("14:00")
+        )
+        assert states(kept) == [("waiting_review", "10:00", "11:00"), ("approved", "11:00", "13:00"),
+                                ("in_queue", "13:00", "14:00")]
+        renewed, facts = prs.lifecycle_from_events(
+            [*base, event("12:30", "review", actor="r1", state="APPROVED", review_id=2), event("13:00", "queued"),
+             event("14:00", "merged")], at("14:00"),
+        )
+        assert states(renewed) == [("waiting_review", "10:00", "11:00"), ("approved", "11:00", "12:00"),
+                                   ("waiting_review", "12:00", "12:30"), ("approved", "12:30", "13:00"),
+                                   ("in_queue", "13:00", "14:00")]
+        assert (facts["reapprovals"], facts["rebase_rereviews"], facts["rereview_seconds"]) == (1, 0, 1800)
+
+    def test_the_removal_by_the_merge_is_not_a_removal(self, prs):
+        events = [
+            event("10:00", "opened"),
+            event("10:10", "review", actor="r1", state="APPROVED", review_id=1),
+            event("10:20", "queued"),
+            event("10:58", "dequeued", detail="merged"),
+            event("11:00", "merged"),
+        ]
+        segments, facts = prs.lifecycle_from_events(events, at("11:00"))
+        assert states(segments)[-1] == ("in_queue", "10:20", "11:00")
+        assert (facts["queue_entries"], facts["queue_removals"]) == (1, 0)
+
+    def test_a_comment_after_the_merge_is_not_part_of_its_way_in(self, prs):
+        events = [event("10:00", "opened"), event("11:00", "merged"),
+                  event("12:00", "review", actor="r1", state="COMMENTED", review_id=1, commit="abc")]
+        _, facts = prs.lifecycle_from_events(events, at("11:00"))
+        assert facts["review_rounds"] == 0
+
+    def test_without_graphql_the_queue_comes_from_the_runs(self, prs):
+        attempts = [
+            {"started_at": at("13:05"), "completed_at": at("13:50"), "ejected": 1, "conclusion": "failure",
+             "ejection_kind": "check_failed", "ejection_reason": "e2e / vmaas failed", "url": "https://run/1"},
+            {"started_at": at("15:12"), "completed_at": at("15:59"), "ejected": 0, "conclusion": "success",
+             "url": "https://run/2"},
+        ]
+        events = lifecycle_of(prs, graph=False, attempts=attempts)
+        queue = [(item["at"][11:16], item["kind"], item["source"], item["detail"])
+                 for item in events if item["kind"] in ("queued", "dequeued")]
+        assert queue == [("13:05", "queued", "runs", ""), ("13:50", "dequeued", "runs", "e2e / vmaas failed"),
+                         ("15:12", "queued", "runs", "")]
+        assert not [item for item in events if item["kind"] == "auto_merge_on"], "auto-merge is GraphQL only"
+        assert all(item["teams"] == [] for item in events if item["kind"] == "review")
+
+    def test_working_groups_come_from_who_approved_for_whom(self, prs):
+        cases = {
+            # reviewer1 commented for wg-vmaas, then approved.
+            "merged_pr": (["wg-vmaas"], 1, "wg-vmaas"),
+            # Only the parent of the working groups: any one of them.
+            "ejected_pr": (["maintainers"], 1, "any WG"),
+            # Two code-owner requests still pending at the close; a request
+            # for a person is not a team.
+            "closed_pr": (["wg-connectivity", "wg-infra"], 2, "wg-connectivity, wg-infra"),
+            # maintainers next to working groups adds nothing.
+            LIFECYCLE: (["maintainers", "wg-caas", "wg-vmaas"], 2, "wg-caas, wg-vmaas"),
+        }
+        for name, (teams, count, display) in cases.items():
+            graph = load_fixture(name)["graph"]
+            assert prs.owner_teams(graph) == teams, name
+            assert prs.wgs_required(prs.owner_teams(graph)) == count, name
+            assert prs.wgs_display(prs.owner_teams(graph)) == display, name
+        assert prs.owner_teams(None) is None and prs.wgs_required(None) is None
+        assert (prs.wgs_required([]), prs.wgs_display([])) == (0, "none")
+        assert prs.required_teams(load_fixture(LIFECYCLE)["graph"]) == {"wg-caas", "wg-vmaas"}
+
+    def test_the_wgs_filter_reads_the_plus_however_it_arrives(self, prs):
+        assert [prs.wgs_filter(value) for value in ("", "all", "$__all", "0", "1", "2", "3", "3+", "3plus", "x")] == [
+            "", "", "", "0", "1", "2", "3plus", "3plus", "3plus", "",
+        ]
+
+    def test_the_cycles_keep_the_order_of_the_stretches(self, prs):
+        segments = [
+            {"state": "waiting_review", "seconds": 10}, {"state": "with_author", "seconds": 20},
+            {"state": "waiting_review", "seconds": 30}, {"state": "approved", "seconds": 40},
+            {"state": "in_queue", "seconds": 50},
+        ]
+        row = prs.lifecycle_cycles(segments)
+        assert list(row) == prs._cycle_fields()
+        assert {key: value for key, value in row.items() if value} == {
+            "waiting_review_1": 10, "with_author_1": 20, "waiting_review_2": 30, "approved_2": 40, "in_queue_2": 50,
+        }
+        many = [{"state": state, "seconds": 1} for _ in range(12) for state in ("waiting_review", "with_author")]
+        row = prs.lifecycle_cycles(many)
+        last = prs.LIFECYCLE_CYCLES
+        assert row[f"waiting_review_{last}"] == 12 - last + 1, "the rounds past the last cycle add up in it"
+        assert sum(value or 0 for value in row.values()) == 24
+
+
+class TestLifecycleStored:
+    def test_the_backfill_stores_the_lifecycle_and_its_events(self, prs, lifecycle_service, lifecycle_github):
+        summary = run_backfill(lifecycle_service)
+        assert summary["prs_stored"] == 1
+        assert summary["graphql_calls"] == 1
+        assert summary["graphql_remaining"] == 4990
+        assert lifecycle_github.posts == ["graphql:osac#104"]
+        row = pr_row(lifecycle_service, 104)
+        assert row["record_version"] == prs.RECORD_VERSION
+        assert (row["files_changed"], row["additions"], row["deletions"]) == (7, 240, 31)
+        assert json.loads(row["owner_teams"]) == ["maintainers", "wg-caas", "wg-vmaas"]
+        assert row["wgs_required"] == 2
+        assert (row["review_rounds"], row["reapprovals"], row["rebase_rereviews"]) == (5, 2, 2)
+        assert (row["approvals_dismissed"], row["merge_commits"], row["auto_merge"]) == (2, 1, 1)
+        assert (row["queue_entries"], row["queue_removals"]) == (2, 1)
+        assert json.loads(row["removal_reasons"]) == ["failed checks"]
+        # The queue entry is GitHub's own time; no merge_group run is needed.
+        assert row["enqueued_at"] == row["queued_at"] == at("13:05")
+        # A dismissed approval was still the first one.
+        assert row["first_approval_at"] == at("11:00")
+        assert row["waiting_seconds"] == 2 * 3600 + 5 * 60, "first approval to the queue"
+        assert row["last_approval_wait_seconds"] == 5 * 60, "last approval before the queue to the queue"
+        assert row["first_review_at"] == at("10:00")
+        assert [segment["state"] for segment in json.loads(row["lifecycle"])][:4] == [
+            "draft", "waiting_review", "with_author", "partly_approved",
+        ]
+        timeline = rows(lifecycle_service, "SELECT * FROM pr_timeline WHERE number = 104 ORDER BY seq")
+        assert len(timeline) == 19
+        assert (timeline[0]["kind"], timeline[0]["label"], timeline[0]["since_open_s"]) == (
+            "opened", "Opened as a draft", 0,
+        )
+        assert (timeline[-1]["kind"], timeline[-1]["since_open_s"]) == ("merged", 8 * 3600)
+        assert next(item for item in timeline if item["kind"] == "dequeued")["detail"] == "failed checks"
+
+    def test_a_force_run_rewrites_the_events_in_place(self, lifecycle_service):
+        run_backfill(lifecycle_service)
+        run_backfill(lifecycle_service, force=True)
+        assert len(rows(lifecycle_service, "SELECT * FROM pr_timeline WHERE number = 104")) == 19
+
+    def test_the_pull_request_document_carries_the_lifecycle(self, lifecycle_service):
+        run_backfill(lifecycle_service)
+        doc = lifecycle_service.get_json({"number": ["104"], "repo": [REPO]})
+        chart = doc["lifecycle"][0]
+        assert list(chart)[:4] == ["category", "01 · Draft", "02 · Waiting for a reviewer", "03 · With the author"]
+        assert chart["04 · Waiting for another WG"] == 7200
+        assert list(chart)[-1] == "11 · In the merge queue"
+        assert doc["events"][0] == {
+            "at": at("08:00"), "when": "05 Oct 08:00", "since_open_s": 0, "what": "Opened as a draft",
+            "who": "author4", "detail": "draft", "url": "https://github.com/osac-project/osac/pull/104",
+            "kind": "opened",
+        }
+        facts = {row["fact"]: row["value"] for row in doc["facts"]}
+        assert facts["Size"] == "7 files, +240 -31 lines"
+        assert facts["Working groups that had to approve"] == "2 (wg-caas, wg-vmaas)"
+        assert facts["Review rounds"] == "5"
+        assert facts["Re-approved after the code changed"] == "2 (2 after a rebase); the longest took 30m"
+        assert facts["Merge queue"] == "2 entries, removed once (failed checks)"
+        assert facts["Merge when ready"] == "used"
+        assert facts["Last approval to the queue"] == "5m"
+
+    def test_a_row_stored_before_the_lifecycle_says_not_measured(self, prs, lifecycle_service):
+        run_backfill(lifecycle_service)
+        with sqlite3.connect(lifecycle_service.db_file) as conn:
+            columns = [name for name, _ in prs.PR_EVENT_ADDED_COLUMNS if name not in (
+                "ready_at", "review_wait_seconds", "force_push_count", "changes_requested_count",
+                "human_review_count", "e2e_runs", "e2e_failures", "e2e_retests", "e2e_versions", "record_version")]
+            conn.execute(f"UPDATE pr_events SET {', '.join(f'{name} = NULL' for name in columns)}")
+            conn.execute("DELETE FROM pr_timeline")
+        doc = lifecycle_service.get_json({"number": ["104"], "repo": [REPO]})
+        assert doc["lifecycle"] == [] and doc["events"] == []
+        facts = {row["fact"]: row["value"] for row in doc["facts"]}
+        assert facts["Review rounds"].startswith("not measured yet")
+        assert facts["Working groups that had to approve"].startswith("not measured yet")
+        assert any("stored before the lifecycle" in note for note in doc["notes"])
+
+    def test_a_failed_graphql_answer_stores_the_older_format_and_retries(self, prs, lifecycle_service,
+                                                                         lifecycle_github):
+        lifecycle_github.add_graphql(REPO, 104, FakeResponse(502, text="bad gateway"))
+        summary = run_backfill(lifecycle_service)
+        assert summary["prs_stored"] == 1
+        row = pr_row(lifecycle_service, 104)
+        assert row["record_version"] == prs.COUNTS_RECORD_VERSION, "read again by a later pass"
+        assert row["wgs_required"] is None and row["files_changed"] is None, "not measured, not zero"
+        # The REST history still gives the lifecycle, without the queue.
+        assert json.loads(row["lifecycle"])[0]["state"] == "draft"
+        lifecycle_github.add_graphql(REPO, 104, graphql_response(load_fixture(LIFECYCLE)["graph"]))
+        run_backfill(lifecycle_service)
+        row = pr_row(lifecycle_service, 104)
+        assert (row["record_version"], row["wgs_required"]) == (prs.RECORD_VERSION, 2)
+
+    def test_a_refused_team_field_leaves_the_working_groups_unknown(self, prs, lifecycle_service,
+                                                                   lifecycle_github):
+        graph = load_fixture(LIFECYCLE)["graph"]
+        refused = {**graph, "reviews": {"nodes": [{**node, "onBehalfOf": None} for node in graph["reviews"]["nodes"]]}}
+        lifecycle_github.add_graphql(REPO, 104, FakeResponse(payload={
+            "data": {"rateLimit": {"cost": 1, "remaining": 4000}, "repository": {"pullRequest": refused}},
+            "errors": [{"type": "FORBIDDEN", "message": "Resource not accessible by integration",
+                        "path": ["repository", "pullRequest", "reviews", "nodes", 0, "onBehalfOf"]}],
+        }))
+        run_backfill(lifecycle_service)
+        row = pr_row(lifecycle_service, 104)
+        assert row["record_version"] == prs.RECORD_VERSION, "a refusal is the token's scope: reading again won't help"
+        assert row["wgs_required"] is None and row["owner_teams"] is None, "unknown, not 'no code owner'"
+        assert (row["files_changed"], row["queue_entries"], row["auto_merge"]) == (7, 2, 1), "the rest is kept"
+
+    def test_refused_queue_events_fall_back_to_the_runs(self, prs):
+        graph = {**load_fixture(LIFECYCLE)["graph"], "timeline": None}
+        fixture = load_fixture(LIFECYCLE)
+        attempt = {"started_at": at("13:06"), "completed_at": at("15:59"), "ejected": 0, "conclusion": "success",
+                   "url": "https://run/1"}
+        events = prs.lifecycle_events(fixture["pr"], fixture["timeline"], fixture["reviews"], fixture["commits"],
+                                      graph, [attempt])
+        assert [(item["at"][11:16], item["source"]) for item in events if item["kind"] == "queued"] == [
+            ("13:06", "runs"),
+        ]
+
+    def test_the_exporter_posts_the_query(self, wfe, exporter, github, monkeypatch):
+        # This module's github fixture does not patch requests; the POST
+        # must not leave the test.
+        monkeypatch.setattr(wfe.requests, "post", github.post)
+        github.add_graphql(REPO, 7, graphql_response({"changedFiles": 1}))
+        resp = exporter._post(f"{wfe.API_URL}/graphql", {"query": "query", "variables": {"name": REPO, "number": 7}})
+        assert resp.ok
+        assert github.posts == [f"graphql:{REPO}#7"]
+
+    def test_a_graphql_error_payload_is_a_failed_answer(self, prs, lifecycle_service, lifecycle_github):
+        lifecycle_github.add_graphql(REPO, 104, FakeResponse(payload={"errors": [{"message": "rate limited"}]}))
+        run_backfill(lifecycle_service)
+        assert pr_row(lifecycle_service, 104)["record_version"] == prs.COUNTS_RECORD_VERSION
+
+    def test_a_low_graphql_budget_stops_the_pass(self, prs, lifecycle_service, lifecycle_github):
+        lifecycle_github.add_graphql(REPO, 104, graphql_response(load_fixture(LIFECYCLE)["graph"], remaining=50))
+        summary = run_backfill(lifecycle_service)
+        assert "GraphQL points remaining 50" in summary["stopped_early"]
+        assert summary["listing_complete"] is False
+
+    def test_refresh_old_refetches_every_older_row_in_one_pass(self, prs, service, github, monkeypatch):
+        for name in ("merged_pr", "ejected_pr", "closed_pr"):
+            created = datetime.fromisoformat(load_fixture(name)["pr"]["created_at"].replace("Z", "+00:00"))
+            github.add(runs_window_path(created, NOW), FakeResponse(
+                payload={"total_count": 7, "workflow_runs": load_fixture("merge_group_runs")["runs"]}))
+        run_backfill(service)
+        with sqlite3.connect(service.db_file) as conn:
+            conn.execute("UPDATE pr_events SET record_version = 2")
+        monkeypatch.setattr(prs, "LEGACY_REFRESH_PER_PASS", 1)
+        service.refresh_old = True
+        summary = run_backfill(service)
+        assert summary["prs_stored"] == 3, "no per-pass bound"
+        upgraded = rows(service, "SELECT number FROM pr_events WHERE record_version = ?", (prs.RECORD_VERSION,))
+        assert len(upgraded) == 3
+
+    def test_the_command_line_refresh_old_runs_a_full_pass(self, prs, monkeypatch, tmp_path):
+        seen = {}
+
+        def backfill(self, days, force, limit, mode):
+            seen.update(days=days, mode=mode, refresh_old=self.refresh_old)
+            return {"ok": True}
+
+        monkeypatch.setattr(prs.CIObservePRs, "backfill", backfill)
+        monkeypatch.setattr(prs, "StandaloneAPI", lambda: object())
+        assert prs.main(["--days", "90", "--refresh-old", "--db", str(tmp_path / "prs.db")]) == 0
+        assert seen == {"days": 90, "mode": "full", "refresh_old": True}
+        assert prs.main(["--days", "90", "--db", str(tmp_path / "prs.db")]) == 0
+        assert seen == {"days": 90, "mode": "auto", "refresh_old": False}
+
+    def test_an_open_pull_request_gets_its_lifecycle_to_now(self, prs, service, github):
+        run_backfill(service)
+        fixture = load_fixture(LIFECYCLE)
+        open_pr = {**fixture["pr"], "number": 905, "state": "open", "merged_at": None, "closed_at": None}
+        github.add(f"/repos/osac-project/{REPO}/pulls/905", FakeResponse(payload=open_pr))
+        timeline = [item for item in fixture["timeline"] if item.get("event") != "merged"]
+        route_pr(github, {**fixture, "pr": open_pr, "timeline": timeline}, number=905)
+        graph = {**fixture["graph"], "timelineItems": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            node for node in fixture["graph"]["timelineItems"]["nodes"] if node["createdAt"] < at("15:00")
+        ]}}
+        github.add_graphql(REPO, 905, graphql_response(graph))
+
+        doc = service.get_json({"number": ["905"], "repo": [REPO]})
+
+        assert doc["source"] == "live"
+        chart = doc["lifecycle"][0]
+        last = list(chart)[-1]
+        # Re-approved by both working groups at 15:10 and not queued again:
+        # approved, not queued, up to the page's now.
+        assert last.endswith("Approved, not queued")
+        assert chart[last] == round((NOW - datetime(2026, 10, 5, 15, 10, tzinfo=UTC)).total_seconds())
+        assert doc["events"][-1]["what"] == "Approved"
+        assert {row["fact"]: row["value"] for row in doc["facts"]}["Working groups that had to approve"] == (
+            "2 (wg-caas, wg-vmaas)"
+        )
+
+
+class TestAcrossPullRequests:
+    @pytest.fixture
+    def filled(self, service, lifecycle_github, github):
+        """The three fixture pull requests and #104 in one store."""
+        run_backfill(service)
+        fixture = load_fixture(LIFECYCLE)
+        route_pr(github, fixture)
+        github.add(PULLS_PATH, FakeResponse(payload=[fixture["pr"]]))
+        created = datetime.fromisoformat(fixture["pr"]["created_at"].replace("Z", "+00:00"))
+        github.add(runs_window_path(created, NOW), FakeResponse(payload={"total_count": 0, "workflow_runs": []}))
+        run_backfill(service)
+        return service
+
+    def test_the_index_filters_by_author_and_working_groups(self, filled):
+        everything = filled.get_json({"days": ["30"]})
+        assert [row["number"] for row in everything["prs"]] == [104, 103, 102, 101]
+        assert everything["authors"] == [
+            {"author": "author1", "label": "author1 (1)"}, {"author": "author2", "label": "author2 (1)"},
+            {"author": "author3", "label": "author3 (1)"}, {"author": "author4", "label": "author4 (1)"},
+        ]
+        one = filled.get_json({"days": ["30"], "author": ["author4"]})
+        assert [row["number"] for row in one["prs"]] == [104]
+        assert one["authors"] == everything["authors"], "the author list does not filter itself"
+        assert one["kpis"][0]["prs"] == 1
+        assert "author author4" in one["notes"][-1]
+        two = filled.get_json({"days": ["30"], "wgs": ["2"]})
+        assert [row["number"] for row in two["prs"]] == [104, 102]
+        assert [row["number"] for row in filled.get_json({"days": ["30"], "wgs": ["1"]})["prs"]] == [103, 101]
+        assert filled.get_json({"days": ["30"], "wgs": ["3+"]})["prs"] == []
+        assert len(filled.get_json({"days": ["30"], "author": ["all"], "wgs": ["all"]})["prs"]) == 4
+        assert "var-pr_author=author4&var-wgs=all" in one["prs"][0]["detail_url"], "the filters ride along"
+
+    def test_the_index_serves_every_across_pr_view(self, filled):
+        doc = filled.get_json({"days": ["30"]})
+        assert [point["pull_request"] for point in doc["scatter_wg1"]] == [
+            "#103 Retry the metrics exporter", "#101 Add VM restart coverage",
+        ]
+        assert [point["hours"] for point in doc["scatter_wg2"]] == [8.0]
+        assert doc["scatter_wg2"][0]["teams"] == "wg-caas, wg-vmaas"
+        assert doc["scatter_wg0"] == doc["scatter_wg3plus"] == doc["scatter_unknown"] == []
+        by_wgs = {row["group"]: row for row in doc["time_by_wgs"]}
+        assert by_wgs["2 WGs · 1 PR"]["partly_approved"] == 7800
+        assert by_wgs["No code owner · 0 PRs"]["draft"] is None, "no pull request is not zero"
+        assert doc["time_by_files"][0]["group"].startswith("up to 2 files")
+        assert doc["rounds_histogram"] == [
+            {"bucket": "0", "prs": 0}, {"bucket": "1", "prs": 2}, {"bucket": "2", "prs": 0},
+            {"bucket": "3", "prs": 0}, {"bucket": "4", "prs": 0}, {"bucket": "5+", "prs": 1},
+        ]
+        assert [row["prs"] for row in doc["queue_histogram"]] == [0, 0, 2, 1, 0]
+        assert doc["wgs_histogram"] == [
+            {"bucket": "No code owner", "prs": 0}, {"bucket": "1 WG", "prs": 2},
+            {"bucket": "2 WGs", "prs": 1}, {"bucket": "3+ WGs", "prs": 0},
+        ]
+        weeks = [row["week"] for row in doc["merge_time_heatmap"]]
+        assert weeks == sorted(weeks) and len(weeks) == 5, "every week of the window, the empty ones too"
+        merged_week = next(row for row in doc["merge_time_heatmap"] if row["week"] == "2026-10-05")
+        assert merged_week["h4_24"] == 1, "#104 took 8 hours"
+        slowest = doc["lifecycles"]
+        assert slowest[0]["pull_request"].startswith("#104 ")
+        assert slowest[0]["partly_approved_1"] == 7200 and slowest[0]["partly_approved_2"] == 600
+        kpis = doc["kpis"][0]
+        assert kpis["lifecycle_prs"] == 3
+        assert kpis["multi_wg_share"] == round(1 / 3, 4)
+        assert kpis["reapproved_share"] == round(1 / 3, 4)
+        assert kpis["last_approval_wait_median_s"] == 600
+
+    def test_the_index_is_built_once_for_the_panels_that_ask_together(self, prs, filled, monkeypatch):
+        calls = []
+        original = prs.CIObservePRs.index_document
+
+        def counting(self, *args, **kwargs):
+            calls.append(args)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(prs.CIObservePRs, "index_document", counting)
+        prs._INDEX_CACHE.clear()
+        first = filled.get_json({"days": ["30"]})
+        assert filled.get_json({"days": ["30"]}) is first
+        assert len(calls) == 1
+        filled.get_json({"days": ["30"], "author": ["author1"]})
+        assert len(calls) == 2, "another filter is another document"
+        with sqlite3.connect(filled.db_file) as conn:
+            conn.execute("UPDATE pr_events SET title = 'Renamed' WHERE number = 101")
+        assert next(row for row in filled.get_json({"days": ["30"]})["prs"] if row["number"] == 101)["title"] == (
+            "Renamed"
+        ), "a write to the store is never hidden"
+        assert len(calls) == 3
+
+    def test_the_list_leaves_out_the_raw_lifecycle(self, filled):
+        row = filled.get_json({"days": ["30"]})["prs"][0]
+        for column in ("lifecycle", "lifecycle_seconds", "removal_reasons", "owner_teams"):
+            assert column not in row, column
+        assert row["teams_display"] == "wg-caas, wg-vmaas"
+        assert row["lines_display"] == "+240 -31"
+
+    def test_an_empty_store_still_answers_every_view(self, prs, tmp_path):
+        doc = prs.CIObservePRs(db_file=str(tmp_path / "missing.db")).get_json({"days": ["30"]})
+        for key in ("authors", "scatter_wg1", "time_by_wgs", "rounds_histogram", "merge_time_heatmap",
+                    "lifecycles", "lifecycle", "events", "facts"):
+            assert key in doc, key
+        assert doc["lifecycles"] == [] and doc["authors"] == []

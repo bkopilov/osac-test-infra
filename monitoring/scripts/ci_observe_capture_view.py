@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.error
@@ -74,6 +75,8 @@ PYTEST_CLASSES = ("test", "fixture", "fixture_use", "wait", "session")
 # span_type this module knows. It is reported as unclassified, never as a
 # short table.
 SPAN_CLASSES = (*PYTEST_CLASSES, "other")
+
+ORG = os.getenv("GITHUB_ORG", "osac-project")
 
 REGISTRY_FIELDS = (
     "run_id",
@@ -244,14 +247,19 @@ class CIObserveCaptureView:
     """
 
     # A complete trace is stable, so a positive answer is cached for ten
-    # minutes. not_indexed and busy are expected to clear, so they are held
-    # for ten seconds: an open page retries soon without hammering Tempo.
+    # minutes. not_indexed, busy and missing are expected to clear, so they
+    # are held briefly: a capture that registers while a page is open must not
+    # stay "missing" for ten minutes.
     CACHE_TTL_SECONDS = 600
-    NEGATIVE_CACHE_TTL_SECONDS = 10
+    NEGATIVE_CACHE_TTL_SECONDS = 30
     # A capture with no "test run" span yet may still be exporting spans: the
     # session span is written last. Its tables are partial, so re-read it
     # within a minute instead of pinning a partial count for ten.
     INCOMPLETE_CACHE_TTL_SECONDS = 60
+    # A trace whose last span is this recent is treated as a run still in
+    # progress, not as a capture that ended without a session span. A single
+    # E2E test can run for many minutes without exporting a new span.
+    RUNNING_WINDOW_SECONDS = 30 * 60
     CACHE_MAX_BYTES = 64 * 1024 * 1024
 
     # A trace larger than this is not read into memory. The live traces
@@ -345,7 +353,7 @@ class CIObserveCaptureView:
             return copy.deepcopy(document)
 
     def _store(self, capture_id, document) -> None:
-        if document["state"] in ("not_indexed", "busy") or document.get("transient"):
+        if document["state"] in ("not_indexed", "busy", "missing") or document.get("transient"):
             ttl = self.NEGATIVE_CACHE_TTL_SECONDS
         elif document["state"] == "ok" and not document["coverage"]["session_span"]:
             ttl = self.INCOMPLETE_CACHE_TTL_SECONDS
@@ -376,6 +384,21 @@ class CIObserveCaptureView:
             run_id = _as_int(registry.get("run_id"))
         if run_attempt is None and registry:
             run_attempt = _as_int(registry.get("run_attempt"))
+
+        job_rows, _ = self._job_rows(run_id, run_attempt)
+        repo = next((str(row.get("repo") or "") for row in job_rows if row.get("repo")), "")
+        identity["repo"] = repo
+        identity["run_url"] = ""
+        identity["pr_url"] = ""
+        identity["commit_url"] = ""
+        if repo and run_id is not None:
+            identity["run_url"] = f"https://github.com/{ORG}/{repo}/actions/runs/{run_id}"
+        pr_number = str(identity.get("pr") or "").lstrip("#")
+        if repo and pr_number:
+            identity["pr_url"] = f"https://github.com/{ORG}/{repo}/pull/{pr_number}"
+        commit_sha = str(identity.get("test_sha") or "")
+        if repo and re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+            identity["commit_url"] = f"https://github.com/{ORG}/{repo}/commit/{commit_sha}"
 
         window = self._run_window(run_id, run_attempt, registry)
         document = self._empty_document(capture_id)
@@ -469,10 +492,14 @@ class CIObserveCaptureView:
         if not session["workers"]:
             notes.append("the trace records no xdist worker; the worker column stays empty")
         if coverage["session_span"] == 0:
-            notes.append(
-                "the trace has no 'test run' session span; the session duration is "
-                "the trace wall clock, and the capture is incomplete"
-            )
+            if session["status"] is None and self._recently_active(session):
+                session["status"] = "running"
+                notes.append("the capture is still running; the session span is written when the run ends")
+            else:
+                notes.append(
+                    "the trace has no 'test run' session span; the session duration is "
+                    "the trace wall clock, and the capture is incomplete"
+                )
         if coverage["spans_unclassified"]:
             notes.append(
                 f"{coverage['spans_unclassified']} spans are outside the pytest classes "
@@ -480,6 +507,13 @@ class CIObserveCaptureView:
                 "as a test result"
             )
 
+        document["summary"] = [
+            {
+                "status": self._github_outcome(run_id, run_attempt) or session.get("status"),
+                "tests": session.get("tests"),
+                "duration_seconds": session.get("duration_seconds"),
+            }
+        ]
         document.update(
             state="ok",
             session=session,
@@ -493,6 +527,35 @@ class CIObserveCaptureView:
         document["failed_tests"] = self._cached_failed_tests(run_id, run_attempt, notes)
         document["notes"] = notes
         return document
+
+    def _github_outcome(self, run_id, run_attempt):
+        """The run's GitHub conclusion, normalized, or None while it runs.
+
+        GitHub owns pass or fail: a setup or teardown error can fail the job
+        without marking the pytest session span as an error.
+        """
+        rows, _ = self._job_rows(run_id, run_attempt)
+        conclusions = {
+            str(row.get("conclusion") or "").lower()
+            for row in rows
+            if str(row.get("status") or "").lower() == "completed"
+        }
+        if conclusions & {"failure", "timed_out", "action_required"}:
+            return "error"
+        if "cancelled" in conclusions:
+            return "cancelled"
+        if "success" in conclusions:
+            return "ok"
+        return None
+
+    def _recently_active(self, session) -> bool:
+        """True when the trace's last span is recent enough to be a live run."""
+        started = _parse_time(session.get("started_at"))
+        if started is None:
+            return False
+        duration = session.get("duration_seconds") or 0
+        last_span = started + timedelta(seconds=duration)
+        return datetime.now(UTC) - last_span <= timedelta(seconds=self.RUNNING_WINDOW_SECONDS)
 
     def _empty_document(self, capture_id):
         return {
@@ -517,7 +580,14 @@ class CIObserveCaptureView:
                 "service_calls": 0,
                 "service_calls_complete": False,
             },
-            "identity": {field: "" for field in REGISTRY_FIELDS},
+            "identity": {
+                **{field: "" for field in REGISTRY_FIELDS},
+                "repo": "",
+                "run_url": "",
+                "pr_url": "",
+                "commit_url": "",
+            },
+            "summary": [{"status": None, "tests": None, "duration_seconds": None}],
             "tests": [],
             "waits": [],
             "fixtures": [],
@@ -890,6 +960,7 @@ class CIObserveCaptureView:
             elif entry["class"] == "fixture_use":
                 buckets["fixture_uses"].append(self._fixture_use_row(entry))
 
+        self._add_breakdown(buckets["tests"], spans)
         for rows in buckets.values():
             rows.sort(key=lambda row: (row["started_at"] or "", row["name"], row.get("worker") or ""))
 
@@ -932,6 +1003,34 @@ class CIObserveCaptureView:
             "service_calls_complete": False,
         }
         return session, buckets, coverage
+
+    @staticmethod
+    def _add_breakdown(tests, spans):
+        """Each test's split into setup, waiting for the product, test
+        actions and teardown (the span rollup's own breakdown, so the run
+        page and the cross-run pages agree). Best-effort: a failure leaves
+        the test rows as they are, it never breaks the document."""
+        try:
+            # The sibling module, wherever this one was loaded from.
+            here = os.path.dirname(os.path.abspath(__file__))
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            import ci_observe_spans
+
+            rows, _, _, _ = ci_observe_spans.breakdown(spans)
+        except Exception:  # pragma: no cover - the rows stay as they were
+            logger.debug("test breakdown failed", exc_info=True)
+            return
+        by_node = {row["nodeid"]: row for row in rows}
+        for test in tests:
+            parts = by_node.get(test["nodeid"])
+            if parts is None:
+                continue
+            test["setup_s"] = round(max(0.0, (parts["setup_s"] or 0) - parts["wait_setup_s"]), 3)
+            test["wait_s"] = parts["wait_s"]
+            test["actions_s"] = round(max(0.0, (parts["call_s"] or 0) - parts["wait_call_s"]), 3)
+            test["teardown_s"] = round(max(0.0, (parts["teardown_s"] or 0) - parts["wait_teardown_s"]), 3)
+            test["waits"] = parts["waits"]
 
     @staticmethod
     def _iter_spans(payload):

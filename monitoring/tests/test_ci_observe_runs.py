@@ -5,7 +5,7 @@ registry, every capture that arrived. Both live in workflow-exporter.db, so
 this endpoint is one SQL page joined on the GitHub run id and never calls
 Tempo.
 
-These tests pin the join, the keyset paging, the 60-day window, the three
+These tests pin the join, the keyset paging, the 30-day window, the three
 registry endpoints, and above all the rule that keeps a data gap from
 becoming a false verdict: a running run, a run that just ended, a registry
 with no answer, a stale answer, an answer older than the run, a run older
@@ -377,6 +377,348 @@ def test_a_registry_with_no_answer_is_unknown(client, jobs, registry):
     assert "never as not collected" in doc["notes"][-1]
 
 
+def test_the_page_verdict_reuses_the_same_rules(client, jobs, registry):
+    """The Pull requests page asks for one run's verdict. A registry without
+    an answer must say unknown there too, never not collected."""
+    state, reason = client.verdict(
+        {
+            "capture_ids": [],
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T01:00:00Z",
+            "conclusion": "success",
+            "status": "completed",
+        }
+    )
+
+    assert state == "unknown"
+    assert "no complete answer" in reason
+
+
+def test_the_page_verdict_keeps_a_found_capture(client, jobs, fresh):
+    state, reason = client.verdict(
+        {
+            "capture_ids": [CAPTURE],
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T01:00:00Z",
+            "conclusion": "success",
+            "status": "completed",
+        }
+    )
+
+    assert state == "capture"
+    assert reason == ""
+
+
+def test_the_page_parses_a_capture_id_the_same_way_as_the_registry(client, fresh):
+    parsed = client.parse_capture_id(f"vmaas-main-{RUN_ID}-a2")
+
+    assert parsed == {"run_id": str(RUN_ID), "run_attempt": "2", "suite": "vmaas"}
+
+
+def test_a_repository_filter_narrows_the_window(client, exporter, fresh):
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, repo="osac"))
+    exporter._upsert_job(run_job(SECOND_RUN_ID, repo="osac-test-infra"))
+
+    doc = client.get_json({"days": ["7"], "repo": ["osac-test-infra"]})
+
+    assert [run["id"] for run in doc["runs"]] == [str(SECOND_RUN_ID)]
+
+
+def test_a_suite_filter_narrows_the_window(client, exporter, fresh):
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, workflow="E2E VMaaS Full Install"))
+    exporter._upsert_job(run_job(SECOND_RUN_ID, workflow="E2E CaaS Full Install"))
+
+    doc = client.get_json({"days": ["7"], "suite": ["caas"]})
+
+    assert [run["id"] for run in doc["runs"]] == [str(SECOND_RUN_ID)]
+
+
+def test_the_vmaas_suite_filter_is_exact(client, exporter, fresh):
+    """vmaas is the VMaaS suite, not every workflow with VMaaS in its name.
+    Production Install, Staging Install and Chart Packaging Smoke run the
+    same full-install workflow but test another scenario, so they are not
+    suite rows."""
+    clear_captures(exporter)
+    rows = {
+        1001: "E2E VMaaS Full Install",
+        1002: "E2E vmaas (pull requests)",
+        1003: "E2E vmaas (merge queue)",
+        1004: "E2E VMaaS Production Install",
+        1005: "E2E VMaaS Chart Packaging Smoke",
+        # The osac-ci dispatcher's historical run name for the same suite.
+        1006: "E2E suite · vmaas · #1620 · " + "a" * 40,
+        # The older caller workflow's name.
+        1007: "E2E VMaaS",
+        1008: "E2E VMaaS Staging Install",
+    }
+    for run_id, workflow in rows.items():
+        exporter._upsert_job(run_job(run_id, workflow=workflow))
+
+    doc = client.get_json({"days": ["7"], "suite": ["vmaas"], "limit": ["50"]})
+
+    assert {run["id"] for run in doc["runs"]} == {"1001", "1002", "1003", "1006", "1007"}
+
+
+def test_the_caas_suite_filter_includes_the_agentless_net_install(client, exporter, fresh):
+    clear_captures(exporter)
+    rows = {
+        1501: "E2E CaaS Full Install",
+        1502: "E2E CaaS PR suite",
+        1503: "E2E CaaS Agentless-Net Full Install",
+        1504: "E2E VMaaS Full Install",
+    }
+    for run_id, workflow in rows.items():
+        exporter._upsert_job(run_job(run_id, workflow=workflow))
+
+    doc = client.get_json({"days": ["7"], "suite": ["caas"], "limit": ["50"]})
+
+    assert {run["id"] for run in doc["runs"]} == {"1501", "1502", "1503"}
+
+
+def test_the_netris_suite_filter_excludes_vmaas(client, exporter, fresh):
+    clear_captures(exporter)
+    rows = {
+        2001: "E2E VMaaS Netris Full Install",
+        2002: "E2E BMaaS Netris Full Install",
+        2003: "E2E VMaaS Netris PR suite",
+        2004: "E2E BMaaS Netris PR suite",
+        2005: "E2E VMaaS Full Install",
+        2006: "E2E netris (pull requests)",
+        2007: "E2E netris (merge queue)",
+        2008: "E2E Netris Full Suite",
+        # The Netris callers append the PR revision to their run name.
+        2009: "E2E VMaaS Netris Full Install / PR #123 @ " + "b" * 40,
+        2010: "E2E BMaaS Netris Full Install / PR #124 @ " + "c" * 40,
+        2011: "E2E VMaaS Production Install",
+    }
+    for run_id, workflow in rows.items():
+        exporter._upsert_job(run_job(run_id, workflow=workflow))
+
+    doc = client.get_json({"days": ["7"], "suite": ["netris"], "limit": ["50"]})
+
+    assert {run["id"] for run in doc["runs"]} == {
+        "2001", "2002", "2003", "2004", "2006", "2007", "2008", "2009", "2010",
+    }
+
+
+def test_the_stretched_suite_filter_is_its_own_set(client, exporter, fresh):
+    clear_captures(exporter)
+    rows = {
+        3001: "E2E Stretched Netris Full Install",
+        3002: "E2E Stretched Netris PR suite",
+        3003: "E2E VMaaS Netris Full Install",
+        3004: "E2E VMaaS Full Install",
+    }
+    for run_id, workflow in rows.items():
+        exporter._upsert_job(run_job(run_id, workflow=workflow))
+
+    doc = client.get_json({"days": ["7"], "suite": ["stretched"], "limit": ["50"]})
+
+    assert {run["id"] for run in doc["runs"]} == {"3001", "3002"}
+
+
+@pytest.mark.parametrize(
+    ("failed_step", "area"),
+    [
+        ("vmaas / e2e-vmaas-full-install / build → Install OSAC", "setup"),
+        (
+            "vmaas / e2e-vmaas-full-install / build → Build and load component images",
+            "setup",
+        ),
+        ("vmaas / e2e-vmaas-full-install / e2e → Run E2E tests", "test"),
+        (
+            "vmaas / e2e-vmaas-full-install / e2e → Run E2E tests (ci-observe capture)",
+            "test",
+        ),
+        ("vmaas / e2e-vmaas-gate → Fail on an upstream failure", "gate"),
+    ],
+)
+def test_the_failed_area_comes_from_the_failed_step(client, exporter, fresh, failed_step, area):
+    """The column reads the step, not the stored failure_reason: the exporter
+    counts install steps as "test" and predates the capture step's name."""
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, conclusion="failure", failed_step=failed_step))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failed_step"] == failed_step
+    assert row["failure_area"] == area
+
+
+def test_the_area_ignores_the_stored_failure_reason(client, exporter, fresh):
+    """Install OSAC is in TEST_STEPS, so the stored reason says "test" even
+    though no pytest ran. The area must still say setup."""
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(
+        RUN_ID,
+        conclusion="failure",
+        failure_reason="test",
+        failed_step="vmaas / e2e-vmaas-full-install / build → Install OSAC",
+    ))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failure_reason"] == "test"
+    assert row["failure_area"] == "setup"
+
+
+def test_a_grouped_run_prefers_the_test_step(client, exporter, fresh):
+    """A multi-suite run stores several "job → step" entries. If any suite
+    reached pytest, that is the area that explains the missing data."""
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(
+        RUN_ID,
+        conclusion="failure",
+        failed_step=(
+            "vmaas / e2e-vmaas-full-install / build → Install OSAC; "
+            "caas / e2e-caas-full-install / e2e → Run E2E tests"
+        ),
+    ))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failure_area"] == "test"
+
+
+@pytest.mark.parametrize(("conclusion", "failed_step"), [("success", ""), ("cancelled", "")])
+def test_a_run_with_no_failed_step_has_a_blank_area(client, exporter, fresh, conclusion, failed_step):
+    """A pass and a cancelled run have nothing to explain, so the cell is
+    blank, not "Test"."""
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, conclusion=conclusion, failed_step=failed_step))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failure_area"] == ""
+    assert row["failed_step_name"] == ""
+
+
+def test_the_failed_step_name_takes_the_first_entry(client, exporter, fresh) -> None:  # noqa: ANN001
+    """A grouped run stores one entry per suite. The column names the first
+    one; the full text stays in failed_step."""
+    clear_captures(exporter)
+    failed_step = (
+        "vmaas / e2e-vmaas-full-install / build → Build and load "
+        "component images; "
+        "caas / e2e-caas-full-install / e2e → Run E2E tests"
+    )
+    exporter._upsert_job(run_job(RUN_ID, conclusion="failure", failed_step=failed_step))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failed_step_name"] == "Build and load component images"
+    assert row["failed_step"] == failed_step
+
+
+def test_the_failed_step_name_handles_a_single_entry(client, exporter, fresh) -> None:  # noqa: ANN001
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(
+        RUN_ID,
+        conclusion="failure",
+        failed_step="vmaas / e2e-vmaas-full-install / build → Install OSAC",
+    ))
+
+    row = exporter.get_ci_observe_run_page(days=7, limit=10)["rows"][0]
+
+    assert row["failed_step_name"] == "Install OSAC"
+
+
+def test_a_failed_step_filter_matches_a_step(client, exporter, fresh) -> None:  # noqa: ANN001
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(
+        RUN_ID,
+        conclusion="failure",
+        failed_step="vmaas / e2e-vmaas-full-install / build → Install OSAC",
+    ))
+    exporter._upsert_job(run_job(
+        SECOND_RUN_ID,
+        conclusion="failure",
+        failed_step=(
+            "caas / e2e-caas-full-install / build → "
+            "Build and load component images"
+        ),
+    ))
+
+    doc = client.get_json({"days": ["7"], "failed_step": ["install osac"]})
+
+    assert [run["id"] for run in doc["runs"]] == [str(RUN_ID)]
+
+
+def test_a_malformed_failed_step_filter_is_ignored_with_a_note(client, jobs, fresh) -> None:  # noqa: ANN001
+    doc = client.get_json({"days": ["7"], "failed_step": ["Install OSAC' OR 1=1"]})
+
+    assert {run["id"] for run in doc["runs"]} == {str(RUN_ID), str(SECOND_RUN_ID)}
+    assert any("failed step" in note and "ignored" in note for note in doc["notes"])
+
+
+def test_a_result_filter_uses_the_grouped_conclusion(client, exporter, fresh):
+    """A run with one failed suite is not a success, even when the result
+    filter is applied to its rows."""
+    clear_captures(exporter)
+    passed = run_job(RUN_ID, id=1001, workflow="E2E vmaas (pull requests)", conclusion="success")
+    passed["run_id"] = str(RUN_ID)
+    failed = run_job(RUN_ID, id=1002, workflow="E2E caas (pull requests)", conclusion="failure")
+    failed["run_id"] = str(RUN_ID)
+    exporter._upsert_job(passed)
+    exporter._upsert_job(failed)
+
+    assert client.get_json({"days": ["7"], "result": ["success"]})["runs"] == []
+    assert [run["id"] for run in client.get_json({"days": ["7"], "result": ["failure"]})["runs"]] == [
+        str(RUN_ID)
+    ]
+
+
+def test_all_means_no_filter(client, exporter, fresh):
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, repo="osac"))
+    exporter._upsert_job(run_job(SECOND_RUN_ID, repo="osac-test-infra", conclusion="failure"))
+
+    doc = client.get_json({"days": ["7"], "repo": ["all"], "suite": ["all"], "result": ["all"]})
+
+    assert {run["id"] for run in doc["runs"]} == {str(RUN_ID), str(SECOND_RUN_ID)}
+
+
+def test_unknown_filter_values_are_ignored_with_a_note(client, jobs, fresh):
+    doc = client.get_json(
+        {"days": ["7"], "repo": ["not a repo"], "suite": ["unknown"], "result": ["flaky"]}
+    )
+
+    assert {run["id"] for run in doc["runs"]} == {str(RUN_ID), str(SECOND_RUN_ID)}
+    assert any("repository" in note and "ignored" in note for note in doc["notes"])
+    assert any("suite" in note and "ignored" in note for note in doc["notes"])
+    assert any("result" in note and "ignored" in note for note in doc["notes"])
+
+
+def test_a_run_carries_the_pr_number_and_its_window(client, exporter, fresh):
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID, pr_display="#123"))
+    fresh.refresh()
+    run = state_of(client.get_json({"days": ["7"]}), RUN_ID)
+
+    assert run["pr_number"] == "123"
+    assert f"var-capture_id={CAPTURE}" in run["details_url"]
+    assert f"from={run['started_at_ms']}" in run["details_url"]
+    assert f"to={run['done_at_ms']}" in run["details_url"]
+
+
+def test_a_recorded_run_opens_the_run_page(client, jobs, fresh):
+    doc = client.get_json({"days": ["7"]})
+    run = state_of(doc, RUN_ID)
+
+    assert run["details_url"].startswith("/d/ci-observe-runs/")
+    assert f"var-capture_id={CAPTURE}" in run["details_url"]
+
+
+def test_an_unrecorded_run_opens_github(client, exporter, fresh):
+    clear_captures(exporter)
+    exporter._upsert_job(run_job(RUN_ID))
+    run = state_of(client.get_json({"days": ["7"]}), RUN_ID)
+
+    assert run["details_url"] == f"https://github.com/osac-project/osac/actions/runs/{RUN_ID}"
+
+
 def test_no_complete_discovery_since_the_run_finished_is_unknown(client, jobs, registry):
     """A run that finished after the registry's last complete answer may have
     sent its capture since. Its absence proves nothing."""
@@ -411,14 +753,14 @@ def test_a_stale_registry_is_unknown(client, exporter, registry):
 
 def test_a_run_older_than_coverage_is_unknown(client, exporter, fresh):
     clear_captures(exporter)
-    """Prometheus keeps 15 days and the registry's coverage starts a day
+    """Prometheus keeps 30 days and the registry's coverage starts a day
     inside that. An older run's capture may have expired, so its absence is
     not evidence."""
     exporter._upsert_job(run_job(
         RUN_ID, created_minutes=30 * 24 * 60, finished_minutes=30 * 24 * 60 - 10
     ))
 
-    doc = client.get_json({"days": ["60"]})
+    doc = client.get_json({"days": ["30"]})
 
     run = state_of(doc, RUN_ID)
     assert run["capture_state"] == "unknown"
@@ -471,7 +813,7 @@ def test_a_junk_capture_id_is_rejected_and_named(client, jobs, registry, sources
 
 
 # ---------------------------------------------------------------------------
-# Paging and the 60-day window
+# Paging and the 30-day window
 # ---------------------------------------------------------------------------
 def test_the_run_page_is_one_sql_statement(client, exporter, wfe, monkeypatch):
     exporter._upsert_job(run_job(RUN_ID))
@@ -522,13 +864,12 @@ def test_an_invalid_before_is_ignored_with_a_note(client, jobs, fresh):
     assert "is not a run id" in doc["notes"][0]
 
 
-def test_a_sixty_day_window_keeps_every_day(client, exporter, fresh, wfe):
-    """The count cap used to cut a 60-day page to about 20 days. One run per
-    day for 60 days must all be listed, and the cap must be above a 60-day
-    volume."""
+def test_a_thirty_day_window_keeps_every_day(client, exporter, fresh, wfe):
+    """The count cap must not cut a full-retention page. One run per day for
+    30 days must all be listed."""
     assert wfe.JOBS_HISTORY_MAX_COUNT >= 300_000
-    exporter._upsert_job(run_job(1, created_minutes=59 * 24 * 60, finished_minutes=59 * 24 * 60 - 10))
-    for day in range(1, 60):
+    exporter._upsert_job(run_job(1, created_minutes=29 * 24 * 60, finished_minutes=29 * 24 * 60 - 10))
+    for day in range(1, 30):
         exporter._upsert_job(run_job(
             1 + day,
             created_minutes=day * 24 * 60,
@@ -536,11 +877,25 @@ def test_a_sixty_day_window_keeps_every_day(client, exporter, fresh, wfe):
         ))
 
     exporter._prune_jobs()
-    doc = client.get_json({"days": ["60"], "limit": ["2000"]})
+    doc = client.get_json({"days": ["30"], "limit": ["2000"]})
 
-    assert len(doc["runs"]) == 60
-    assert doc["counts"]["matched"] == 60
+    assert len(doc["runs"]) == 30
+    assert doc["counts"]["matched"] == 30
     assert doc["truncated"] is False
+
+
+def test_a_pr_suite_run_reports_its_pull_request(client, exporter, fresh):
+    exporter._upsert_job(run_job(
+        workflow="E2E suite · caas · #1620 · " + "a" * 40,
+        trigger="manual",
+    ))
+
+    run = client.get_json({"days": ["30"]})["runs"][0]
+
+    assert run["workflow"] == "E2E CaaS Full Install"
+    assert run["pr"] == "#1620"
+    assert run["trigger"] == "PR"
+    assert run["pr_url"] == "https://github.com/osac-project/osac/pull/1620"
 
 
 def test_run_is_an_exact_lookup_outside_the_window(client, exporter, fresh):
@@ -567,13 +922,13 @@ def test_an_unknown_run_id_is_an_empty_page_with_a_note(client, jobs, fresh):
 @pytest.mark.parametrize(
     ("params", "expected_days", "expected_limit"),
     [
-        ({}, 7, 200),
+        ({}, 30, 200),
         ({"days": ["0"]}, 1, 200),
-        ({"days": ["9999"]}, 60, 200),
-        ({"days": ["nonsense"]}, 7, 200),
-        ({"limit": ["0"]}, 7, 1),
-        ({"limit": ["999999"]}, 7, 2000),
-        ({"limit": ["nonsense"]}, 7, 200),
+        ({"days": ["9999"]}, 30, 200),
+        ({"days": ["nonsense"]}, 30, 200),
+        ({"limit": ["0"]}, 30, 1),
+        ({"limit": ["999999"]}, 30, 2000),
+        ({"limit": ["nonsense"]}, 30, 200),
     ],
 )
 def test_days_and_limit_are_clamped(client, jobs, fresh, params, expected_days, expected_limit):
@@ -929,7 +1284,7 @@ def test_the_registry_defaults_are_documented_constants(wfe):
     assert registry.DEFAULT_LOKI_URL == "http://127.0.0.1:3100"
     assert registry.POLL_SECONDS == 60
     assert registry.CAPTURE_LABEL == "osac_ci_capture_id"
-    assert registry.PROMETHEUS_RETENTION_DAYS == 15
+    assert registry.PROMETHEUS_RETENTION_DAYS == 30
     assert registry.LOKI_RETENTION_DAYS == 30
 
 

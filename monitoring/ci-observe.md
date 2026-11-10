@@ -5,49 +5,54 @@ For an introduction, start with [ci-observe/README.md](ci-observe/README.md).
 
 The application and the individual tests keep their current source and behavior.
 
-## Status at the 2026-11-01 cutover
+## Status at 2026-11-07
 
-The collector-first prototype became the live CI path. What works now, all verified
-against the central backend on `osac-ci-1`:
+The ci-observe pages were redesigned around four across-runs pages. Built and checked against a seeded dataset; not yet deployed:
 
-- Live push is the delivery path. A `ci-observe` run streams pytest traces, cluster
-  logs and kubelet metrics to the central backend while the test runs. Nothing is
-  uploaded to GitHub, so the capture step needs no artifact and no gitleaks scan.
-- The dashboard shows real numbers for a finished capture: 17 tests, 24.1 minutes
-  run duration, the slowest-test table with per-test durations. Run duration
-  uses the single `test run` session span, not the separate xdist worker spans.
-- Every E2E wait is a named span (`poll_until` in the osac repo). The 16-minute
-  bmaas metering test breaks down into named waits: instance RUNNING 282 s,
-  metering heartbeats 60 s, instance deletion 243 s.
-- Kubelet metrics arrive: the cluster panels show node and pod CPU and memory.
-- Capture ids are readable (`bmaas-main-<run-id>-a1`), with suite and PR promoted
-  to Loki and Prometheus labels.
-- Delivery is verified after each test: the capture action reports a loud,
-  non-gating error when telemetry was requested but never reached the backend.
-  The job result and the test's own exit code stay unchanged.
-- Traces from the batch era stay queryable through the archive datasource. The
-  31 batch session traces were migrated into Tempo 2.10.
+- **Overview** is the entry page: pass rate, time to result, the wait for a runner, failure causes, flaky and failing tests, the slowest tests, what the tests wait for, and the pull request numbers, per suite and over time.
+- **Where the time goes**, **Why runs fail** and **Test history** replace **Trends**. They read `/api/ci-observe/health`, `time`, `failures`, `tests`, `test` and `waits` (`ci_observe_insights.py`), cached for two minutes.
+- The workflow exporter stores each E2E job's timeline (runner wait, step start and end). `ci_observe_phases.py` maps every step to a phase and every failure to a cause.
+- `ci-observe-trends.timer` runs hourly and reads only runs it has not read; it also archives the suite runs for 90 days. `ci-observe-spans.timer` rolls each recorded run's trace up once into per-test setup, waits, actions and teardown.
+- **Pull requests** gained the window's medians, rebases, reviews, queue ejections and E2E reruns above the one-pull-request detail. `prs.db` keeps 90 days.
+- **Pull requests** gained each pull request's lifecycle: every event (`pr_timeline`), the stretches it spent in each state, review rounds, re-approvals, files changed and the working groups that had to approve; Author and Working groups filters; and the across-pull-request views (every merged pull request as a dot, time to merge per week, where the time goes by working groups and by files, the slowest pull requests stretch by stretch). The backfill reads them with one GraphQL query per pull request on top of the REST calls; GraphQL has its own hourly budget, and the pass stops when fewer than 100 points remain. Rows stored before are read again 100 per pass. To read them all at once, run the one-time catch-up on the central host (re-run it if it stops on the rate limit; it resumes):
 
-What is missing or known gaps:
+  ```bash
+  podman exec workflow-exporter python3 /app/ci_observe_prs.py --days 90 --refresh-old
+  ```
+- **Start here** is now **Runs** (the list), filtered to the three suites; **E2E run** shows where the run's time went.
+- `test_ci_observe_dashboard_contract.py` serves the exporter over the seed and resolves every panel query of every page.
 
-- Beyla service-request spans from the batch era were not migrated, only session
-  traces. Old captures show test spans in the service-request panels.
-- The Traces Drilldown app (v3.1.0) is installed and served but not yet confirmed
-  rendering in a user's browser. Explore with query type Trace ID is the working
-  path to a trace waterfall today.
-- Count stat panels render unitless (`47`, not `47 ns`); `Run duration` keeps its
-  time unit. Verified in Grafana 13.2.4.
-- The router keeps its sending queues in memory. A router restart while a backend
-  is down discards already accepted batches. Persistent queue storage is a
-  follow-up, not part of the cutover.
-- Collectors use `insecure_skip_verify` for the internal CA. Mounting the CA into
-  the gateway pod for real verification is a follow-up.
-- Freshly flushed Tempo blocks are invisible to TraceQL search for up to 15
-  minutes (the backend search sharder skips young blocks). A just-finished run's
-  spans appear with that delay; this is Tempo 2.10 behavior, not a bug.
-- GitHub OAuth users may see a reduced sidebar without Explore. The admin account
-  sees the full navigation. Granting the OAuth users the needed org role is an
-  open task.
+## Status at 2026-11-06
+
+The collector-first path is live. What works now, verified against the central backend on `osac-ci-1`:
+
+- Live push is the delivery path. A recorded run streams pytest traces, cluster logs and kubelet metrics to the central backend while the test runs. The capture step uploads no telemetry. The separate failure gather still uploads a redacted artifact.
+- Standard VMaaS, BMaaS and CaaS full-install runs record by default in both repositories, for pull request, merge queue, scheduled and manual runs. Netris, stretched, agentless and full-regression workflows have no capture action yet.
+- Every store keeps 30 days: Tempo, Prometheus, Loki, the GitHub artifact, the workflow exporter, `prs.db` and `trends.db`.
+- **Start here** shows Run, Workflow, Repository, PR, Branch, Started by, Result, Recorded, Started and GitHub. Repository, Suite and Result filter the data; every column also has a filter. Every identifier is a link. A run with no recording opens GitHub.
+- **E2E run** shows Result, Tests run and Test time, then collapsed Failures, Jobs and steps, Test list, Run info and Cluster rows. Result comes from GitHub. Run info links the run, PR and commit. Jobs and steps show where the time went outside the test itself. Cluster shows pods, CPU, memory and nodes for the run window. The page refreshes every minute.
+- **Pull requests** starts from one pull request, chosen from the list or typed by number. Its identity line links the number, title, author and repository, and one date line says when it opened and merged or closed. Five numbers give the total and the four long stages (Authoring, Review, Waiting and Queue); a value the data cannot support says **not measured**, never 0. A stacked horizontal bar shows all five stages on a fitted duration axis, with a missing stage absent rather than zero. Queue attempts and E2E runs sit below it, newest run first; every identifier is a link. A bottom Status row is the only place a long explanation appears, such as why a pull request is missing or its history could not be read. The dropdown is the browser, so this page has no all-pull-request tables. The Repository control picks `osac` or `osac-test-infra`. A pull request that is still open is read from GitHub when the page loads; while it is still in the queue, queue time runs to now. **Trends** answers "is this test or this job failing more often or getting slower?" for one unit over 7 or 30 days: runs, pass rate, p50, p95, p99 and mean duration, a daily chart, a duration chart and the recent runs. A job is a repository and display name, so retries and suites aggregate. The E2E run page's Jobs table links each job to its history.
+- Capture ids stay readable (`bmaas-main-<run-id>-a1`). Suite and PR are promoted to Loki and Prometheus labels.
+- `monitoring-setup.sh --update-central` queues `ci-observe-trends.service` once after enabling its timer, so the schema migration and the 30-day re-roll start during the deploy. It returns without waiting for them: the backfill takes many minutes. The page keeps the previous rollup until this pass finishes, and the read path tolerates the old schema. A start that systemd cannot queue only warns, and the 04:15 timer retries.
+- Batch-era session traces remain queryable through the archive datasource.
+
+Known gaps:
+
+- No run waterfall or task timeline for queue, provision, build, test and teardown.
+- No attempts or flake view, no Kubernetes events, no waits table, no per-test trace and log links, no service call summary.
+- No CI SLOs, capture coverage target or telemetry pipeline health.
+- No outcome-based sampling and no long-term rollups.
+- Trends window p99 and mean are not measured for days rolled up before raw per-run durations were stored; those days keep their counts and daily p50 and p95.
+- Telemetry still uses `osac.ci.*` names. OpenTelemetry CI/CD and test names are the planned shared vocabulary.
+
+[`ci-observe/observability.md`](ci-observe/observability.md) explains the impact and the order of work.
+
+Operational gaps that remain:
+
+- The router keeps its sending queues in memory. A router restart while a backend is down discards already accepted batches. Persistent queue storage is a follow-up.
+- Collectors use `insecure_skip_verify` for the internal CA. Mounting the CA into the gateway pod for real verification is a follow-up.
+- Freshly flushed Tempo blocks are invisible to TraceQL search for up to 15 minutes. A just-finished run's spans appear with that delay. This is Tempo 2.10 behavior, not a bug.
+- GitHub OAuth users may see a reduced sidebar without Explore. The admin account sees the full navigation.
 
 ## Scope
 
@@ -102,8 +107,11 @@ leader already exited are not reaped, and that gap is accepted.
 
 ## Live telemetry push
 
-An E2E workflow run with the `ci-observe` input deploys the collector
-gateway into the cluster it tests, and the gateway streams every signal
+Every standard full-install E2E run records by default: VMaaS, BMaaS and
+CaaS in both repositories, for pull request, merge queue, scheduled and
+manual runs. Netris, stretched, agentless and full-regression workflows do
+not have capture wired, so they cannot record yet. The workflow deploys the
+collector gateway into the cluster it tests, and the gateway streams every signal
 (pytest and Beyla traces, cluster logs, kubelet metrics, stamped with the
 capture identity) live to the central backend while the test runs:
 
@@ -130,9 +138,16 @@ capture identity) live to the central backend while the test runs:
   `ci-observe-otlp-password`, and the capture action renders it into the
   gateway as a precomputed `Authorization` header. An empty password or
   endpoint degrades to running the test without telemetry — never an
-  unauthenticated push.
-- Nothing touches GitHub: no capture artifact, no upload gate, no scan.
-  Telemetry is visible in the CI Grafana during the run.
+  unauthenticated push. Every caller of the capture-wired full-install
+  workflows passes the secret: the suite callers (full install, pull
+  request and merge queue) and the named installs (`e2e-vmaas-prod-install-caller.yml`,
+  `e2e-vmaas-staging-install-caller.yml`, `e2e-vmaas-chart-packaging-smoke-caller.yml`,
+  `e2e-vmaas-ci-large-caller.yml`). A caller that omits it still runs the
+  tests but records nothing, which reads as "Recorded: No" on the entry
+  page.
+- The capture action does not upload telemetry to GitHub. The separate failure
+  gather step still uploads a redacted artifact. A telemetry failure never
+  changes the test result.
 
 Every captured signal carries run identity and test selection as `osac.ci.*`
 resource attributes. The fields distinguish requested refs, resolved source
@@ -251,11 +266,10 @@ value, it uses a non-empty `unknown` or `none` value because the collector
 rejects empty resource attributes. Invalid refs and SHAs become `unknown`
 whole, never a mangled value.
 
-These identity attributes are wired end to end, but only a live capture
-exercises the full chain: the workflow context, the overlay step output,
-the workspace git metadata and the cluster queries. A post-merge canary
-run with the `ci-observe` input or label must show, in the CI Grafana
-for its capture id: `test_ref` equal to the requested ref, `test_sha`
+These identity attributes are wired end to end, but only a live E2E run
+checks the full path: workflow inputs, test checkout, workspace Git metadata,
+and cluster queries. Standard VMaaS, BMaaS and CaaS full-install runs record
+by default in every trigger. The E2E run page should show: `test_ref` equal to the requested ref, `test_sha`
 matching the osac commit the run's overlay step logged, `test_infra_sha`
 matching the merged test-infra commit (equal to
 `test_infra_workflow_sha` on a scheduled run), `test_suite` naming every

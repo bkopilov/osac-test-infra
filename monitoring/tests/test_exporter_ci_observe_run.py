@@ -143,6 +143,39 @@ class TestParseCaptureId:
         assert wfe.WorkflowExporter._parse_capture_id(capture_id) == (parsed, run_id, attempt)
 
 
+def test_a_step_result_comes_from_the_job_timeline(evidence, github, wfe):
+    """Step durations are stored without a result; the job timeline has one
+    per step. Without it the Result column could only say failed or nothing."""
+    timeline = [{
+        "name": "e2e", "created_at": "2026-04-17T10:00:00Z",
+        "steps": [
+            {"name": "Set up job", "conclusion": "success",
+             "started_at": "2026-04-17T10:00:05Z", "completed_at": "2026-04-17T10:00:06Z"},
+            {"name": "Authorize fork PR", "conclusion": "skipped",
+             "started_at": "2026-04-17T10:00:06Z", "completed_at": "2026-04-17T10:00:06Z"},
+            {"name": "Run E2E tests", "conclusion": "failure",
+             "started_at": "2026-04-17T10:00:07Z", "completed_at": "2026-04-17T10:08:27Z"},
+        ],
+    }]
+    seed_direct_run(
+        evidence,
+        steps=[{"name": "Set up job", "duration_s": 1}, {"name": "Authorize fork PR", "duration_s": 0},
+               {"name": "Run E2E tests", "duration_s": 500}, {"name": "Teardown", "duration_s": 30}],
+        failed_step="e2e → Run E2E tests",
+        timeline_json=json.dumps(timeline),
+    )
+    github.add(RUN_PATH, FakeResponse(payload={"head_sha": "a" * 40}))
+    github.add(LIST_PATH, artifact_payload(wfe.API_URL))
+    github.add(DOWNLOAD_PATH, FakeResponse(content=zip_bytes({"junit.xml": VALID_JUNIT})))
+
+    doc = evidence.get_ci_observe_run_json({"capture_id": [CAPTURE]})
+
+    assert [(step["step_name"], step["conclusion"]) for step in doc["steps"]] == [
+        ("Set up job", "success"), ("Authorize fork PR", "skipped"), ("Run E2E tests", "failure"),
+        ("Teardown", None),
+    ]
+
+
 def test_direct_run_evidence(evidence, github, wfe):
     seed_direct_run(
         evidence,
@@ -168,6 +201,11 @@ def test_direct_run_evidence(evidence, github, wfe):
     assert doc["run"]["url"] == f"https://github.com/osac-project/osac/actions/runs/{RUN_ID}"
     assert [j["name"] for j in doc["jobs"]] == ["osac / E2E VMaaS Full Install"]
     assert doc["jobs"][0]["failure_reason"] == "test"
+    assert doc["jobs"][0]["cause_label"] == "Tests failed", "the cause Why runs fail gives the same failure"
+    # The job name opens its suite's Where the time goes page.
+    assert doc["jobs"][0]["history_url"].startswith("/d/ci-observe-time/")
+    assert "var-suite=vmaas" in doc["jobs"][0]["history_url"]
+    assert "var-repo=osac" in doc["jobs"][0]["history_url"]
     assert doc["steps"] == [
         {
             "job_name": "osac / E2E VMaaS Full Install",
@@ -455,7 +493,7 @@ class TestNative:
         native = evidence.get_ci_observe_run_json({"capture_id": [CAPTURE]})["native"]
 
         assert native["status"] == "expired"
-        assert any("7-day retention" in n for n in native["notes"])
+        assert any("30-day retention" in n for n in native["notes"])
         assert native["artifact_url"] == ARTIFACT_URL
 
     def test_too_large_without_download(self, evidence, github, wfe):
@@ -742,14 +780,12 @@ class TestHTTP:
         assert json.loads(body)["parsed"] == "invalid"
 
 
-# The run-evidence panels live in the CI evidence row of the Capture
-# dashboard (dashboard JSON + its own structural test, which pins the response
-# contract with a static document). This is the other half of that contract:
-# the real endpoint's response must resolve every root_selector/columns pair
-# the row queries.
+# The failed-test table on the E2E run page reads /api/ci-observe/run. This
+# is the other half of that contract: the real endpoint's response must
+# resolve every root_selector/columns pair the table queries.
 DASHBOARDS_DIR = Path(__file__).resolve().parents[1] / "config" / "grafana" / "dashboards"
 CAPTURE_DASHBOARD = DASHBOARDS_DIR / "ci-observe-runs.json"
-CI_EVIDENCE_ROW = "CI evidence"
+RUN_ENDPOINT = "/api/ci-observe/run"
 
 
 def _iter_panels(panels):
@@ -760,12 +796,16 @@ def _iter_panels(panels):
 
 def test_query_shape_resolves_against_the_endpoint_response(evidence, github, wfe):
     """The real /api/ci-observe/run response must resolve every
-    root_selector and column the CI evidence row queries, so the endpoint and
-    the dashboard cannot drift apart."""
+    root_selector and column the failed-test table queries, so the endpoint
+    and the dashboard cannot drift apart."""
     dashboard = json.loads(CAPTURE_DASHBOARD.read_text())
-    (row,) = [p for p in dashboard["panels"] if p["type"] == "row" and p["title"] == CI_EVIDENCE_ROW]
-    panels = [p for p in _iter_panels(row["panels"]) if p["type"] not in ("row", "text")]
-    assert panels, "the CI evidence row has no data panels"
+    panels = [
+        panel
+        for panel in _iter_panels(dashboard["panels"])
+        if panel["type"] not in ("row", "text")
+        and any(RUN_ENDPOINT in target.get("url", "") for target in panel.get("targets", []))
+    ]
+    assert panels, "no panel reads the run endpoint"
     seed_direct_run(
         evidence,
         steps=[{"name": "Run E2E tests", "duration_s": 500}],
@@ -777,10 +817,6 @@ def test_query_shape_resolves_against_the_endpoint_response(evidence, github, wf
     github.add(DOWNLOAD_PATH, FakeResponse(content=zip_bytes({"junit.xml": VALID_JUNIT})))
 
     doc = evidence.get_ci_observe_run_json({"capture_id": [CAPTURE]})
-
-    # The fixture must exercise every table the dashboard reads.
-    assert doc["run"] is not None
-    assert doc["jobs"] and doc["steps"]
     assert doc["native"]["status"] == "available"
     assert doc["native"]["failed_tests"]
 
@@ -794,6 +830,11 @@ def test_query_shape_resolves_against_the_endpoint_response(evidence, github, wf
             for part in selector.split("."):
                 node = node[part]  # KeyError means dashboard/endpoint drift
             rows = node if isinstance(node, list) else [node]
+            if not rows and target["root_selector"] == "timeline":
+                # This run was stored before job timelines existed, so it has
+                # no step timeline; test_ci_observe_dashboard_contract checks
+                # the column shape against seeded timelines.
+                continue
             assert rows, f"{panel['title']}: {target['root_selector']} is empty"
             for column in target["columns"]:
                 assert column["selector"] in rows[0], (

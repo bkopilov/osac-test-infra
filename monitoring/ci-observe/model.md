@@ -1,222 +1,159 @@
-# The ci-observe model
+# CI Observe model
 
-ci-observe answers questions about one unit of CI work, on that unit's timeline.
+CI Observe covers the VMaaS, CaaS and BMaaS E2E suites. Four pages look across runs, three look at one thing.
 
-That sentence decides where every panel, query and dataset belongs. Without it, each new question becomes a new dashboard, and the result is a pile.
-
-The readers are test owners, the monitoring owner and release managers. They ask different questions, and they share the same three units.
-
-## What a dashboard is
-
-The `ci-observe` folder holds three content dashboards: **Capture**, **Pull requests** and **Trends**. It also holds **Start here**, the entry page, which is a router, not a fourth dashboard.
-
-A new question becomes a section on one of the three, not a fourth dashboard. Compare is a section of Trends, not a page of its own.
-
-## Three units
-
-| Unit | What it is | Key | Dashboard |
-|---|---|---|---|
-| **Capture** | One CI run with telemetry | capture id, for example `vmaas-main-41554302161-a1` | Capture |
-| **Pull request** | One proposed change, from opened to merged or closed | pull request number | Pull requests |
-| **Population** | Many CI runs of a test, a suite, a ref, or all jobs, over calendar time | test id, suite, ref, or all | Trends |
-
-A run belongs to a **ref**. A ref is a branch or a pull request. `main` is a ref, and a pull request is a ref with a lifecycle. This keeps scheduled failures from becoming orphans: they belong to the `main` ref.
-
-## Starting a task
-
-The entry page takes a run id, a capture id, a pull request number, a test id, or nothing. Each input resolves to one dashboard in one step. A run id and a capture id open their capture; a pull request number opens Pull requests; a test id opens Trends.
-
-| You have | Start at | It opens |
+| Page | Unit | Question |
 |---|---|---|
-| A run id from Slack, for example `41554302161` | the entry page | that run's capture, or its row in the index marked `not collected` with a GitHub link |
-| A capture id, for example `vmaas-main-41554302161-a1` | the entry page | that capture |
-| A test id | the entry page | that test's history in Trends |
-| A pull request number | the entry page | that pull request's stage funnel |
-| A question about CI overall | Trends, Overview | pass rate, duration and failure mix |
-| Nothing | the entry page | the run index, searchable by run id |
+| **Overview** (entry page) | All suite runs in a window | Is E2E CI healthy, and where should I look? |
+| **Where the time goes** | All suite runs in a window | Which phases, steps, tests and product waits take the time? What got slower? |
+| **Why runs fail** | All failed suite runs in a window | Tests, build, install or CI infrastructure? Which tests fail or flake, and with what error? |
+| **Test history** | One test over a window | How long does it take, is it getting slower, does it fail, what does it wait for? |
+| **Pull requests** | All pull requests in a window, then one pull request | How long do review, approval and the merge queue take? Where does each pull request's time go? How often are pull requests rebased, re-reviewed and rerun? |
+| **All runs** | Every run | Which runs ran, and which one do I open? |
+| **E2E run** | One GitHub Actions run | Did it pass, what failed, and where did its time go? |
 
-## The keys
+The principles, the gaps and the roadmap are in [`observability.md`](observability.md).
 
-Only three keys cross stores. Everything else is a fact owned by one store and reached by link.
+## Filters
 
-| Key | Where it exists today | What is missing |
+The four across-runs pages share four filters, and keep them when you move between them:
+
+| Filter | Values |
+|---|---|
+| Window | 7, 14, 30 or 90 days. **vs before** compares with the same span before it, inside the 90-day archive. |
+| Suite | All suites, VMaaS, CaaS, BMaaS. |
+| Started by | Any trigger, pull requests, merge queue, scheduled (main), manual. |
+| Repository | Both, `osac`, `osac-test-infra`: the repository whose CI started the run. |
+
+A suite is its full-install workflows, its pull-request suite runs and its merge-queue rows:
+
+| Suite | Workflows |
+|---|---|
+| VMaaS | E2E VMaaS, E2E VMaaS Full Install, E2E VMaaS PR suite, `E2E suite · vmaas · …` runs, E2E vmaas merge-queue rows |
+| CaaS | E2E CaaS Full Install, E2E CaaS PR suite, `E2E suite · caas · …` runs, E2E caas merge-queue rows |
+| BMaaS | E2E BMaaS Full Install, E2E BMaaS PR suite, `E2E suite · bmaas · …` runs, E2E bmaas merge-queue rows |
+
+Netris, stretched, CaaS agentless-net, full regression and the named installs (**E2E VMaaS Production Install**, **E2E VMaaS Staging Install**, **E2E VMaaS Chart Packaging Smoke**, **OSAC CI Large**) test other scenarios and are never counted.
+
+## Definitions
+
+| Term | Definition |
+|---|---|
+| Pass rate | Passed ÷ (passed + failed). Cancelled runs are left out. GitHub's conclusion decides. |
+| Time to result | First job created → last job completed, on passing runs. Includes the wait for a runner. Runs stored before job timelines were kept fall back to their stored duration. |
+| Wait for a runner | The E2E job's `created_at` → `started_at`. Not measured for runs stored before job timelines were kept. |
+| Phase | Every step of the three suites' workflows maps to one phase (`ci_observe_phases.py`, pinned by a test against the workflow files): queue, CI setup, cluster and hosts, build, install OSAC, tests, logs and teardown, other. |
+| Cause | The phase of the first failed step decides; a blocked step (fork authorization, refused inputs) is **Blocked**; a timed-out conclusion or a cancelled step in a failed job is **Timed out**; no failed step at all is **Runner lost**. Causes roll up to five areas: Tests, Build, OSAC install, CI infrastructure, Blocked. |
+| Flaky test | Passed and failed on the same commit in the window. |
+| A test's time | From the trace: setup minus its waits, all `poll_until` waits, the call phase minus its waits (test actions), teardown minus its waits. The four add up to setup + call + teardown. A session or module fixture is charged to the first test that sets it up. |
+| Percentiles | Nearest rank over the raw per-run values of the window. |
+| Rebased | At least one `head_ref_force_pushed` event on the pull request. |
+| E2E reruns | E2E runs of a pull request beyond the first of each suite. Not measured when the stores start after the pull request was opened. |
+
+## Overview
+
+| Section | Contents |
+|---|---|
+| Numbers | Pass rate and its change, typical and slow (p90) time to result, typical wait for a runner, share of failures caused by CI, runs, failed runs, runner hours, share of hours on failed runs, flaky tests, tests with a failure. |
+| Suite health | One row per suite and all three: runs, pass rate, time to result and its change, runner wait, the top failure cause, links to the suite's time and failure pages. |
+| Two bars | The average passing run by phase, failed runs by area. |
+| Two lines | Pass rate per day, time to result per day. |
+| Inside the tests | The tests' time split and what they wait for, from recorded runs. |
+| Tests | The tests that fail most and the tests that take the most time. |
+| Latest failed runs | Cause, failed step, run time, link to the run. |
+| Pull requests | The window's pull request numbers. |
+
+## Where the time goes
+
+| Section | Contents |
+|---|---|
+| Numbers | Time to result (median, p90, mean), the runner wait, runner hours, share of hours on failed runs. |
+| Phases | The average passing run by phase per suite, the phase table, phase time per day, the runner wait per day. |
+| Steps | Every step of a passing run: median, p90, share of a run, change. |
+| Inside the tests | The tests' time split, waits by resource kind, every test by total time, every wait signature, shared fixtures. |
+
+## Why runs fail
+
+| Section | Contents |
+|---|---|
+| Numbers | Failed runs, failure rate, and the failed runs per area; cancelled runs apart. |
+| Causes | Per day by area, the cause table with its change, per suite. |
+| Steps that failed | The step, its cause, how often, which suites, the newest such run. |
+| Tests | Every failing test with fail rate, flaky commits and its last error; the flaky tests; error messages grouped after replacing names, ids and numbers. |
+| Failed runs | Every failed run with its cause, failed step, first failed test and error. |
+
+## Test history
+
+| Section | Contents |
+|---|---|
+| Numbers | Runs, failure rate, typical and slow duration, change against the window before, flaky commits. |
+| Charts | The duration of every run (green passed, red failed) with the daily median; passes and failures per day; where its time goes, on average and per day. |
+| Tables | What it waits for, the fixtures it sets up, why it fails, every run. |
+
+A test is keyed by its canonical name, `tests.e2e.vmaas.sanity.test_vm::TestVm::test_create`. The node id (`tests/e2e/vmaas/sanity/test_vm.py::TestVm::test_create`) and the JUnit id resolve to the same key.
+
+## Pull requests
+
+| Section | Contents |
+|---|---|
+| Filters | Window, repository, author, working groups to approve (any, none, 1, 2, 3 or more). |
+| All pull requests | The window's medians (open to merge, wait for first review, review to approval, first and last approval to queue, in the queue), ejections, commits, rebases, force pushes, changes requested, review rounds, re-approvals, files, working groups, E2E runs, reruns and failed E2E runs; stage medians per week; every merged pull request as a dot; time to merge per week; where the time goes by working groups and by files; review rounds, queue entries and working groups per pull request; the 20 slowest pull requests stretch by stretch; every pull request. |
+| One pull request | Identity line, the total and four long stages, the lifecycle bar, every event, its numbers, queue attempts with how each ended and why, every E2E run with the commit it tested, status. |
+
+Authoring runs from opening to the first human review, review to the first approval, waiting to the merge queue, queue to the end of the last attempt. The first approval is the first one given, even when a later push dismissed it; the author's own replies in review threads are not reviews. The merge queue entry is GitHub's added-to-merge-queue time; a row stored before it was read uses the start of the first merge_group run.
+
+The **lifecycle** says where a pull request was at every moment, from its events in order:
+
+| State | From | Until |
 |---|---|---|
-| capture id | Tempo, Loki, Prometheus | not stored in the exporter's SQLite |
-| run id | SQLite `jobs.id`, every span as `osac.ci.run_id`, and inside the capture id | nothing: a trace joins its job row by `osac.ci.run_id` without parsing the capture id |
-| PR number | SQLite `pr_display`, Loki and Prometheus `osac_ci_pr`, Tempo `osac.ci.pr` | queue runs carry no PR number at all |
+| Draft | Opened as a draft, or converted to one | Ready for review |
+| Waiting for a reviewer | Ready, or a push after review comments | A human review |
+| With the author | Changes requested, or comments while it waited | The next push |
+| Waiting for another WG | An approval while other working groups still have to approve | The last working group's approval |
+| Approved, not queued | Every working group approved | Added to the merge queue |
+| In the merge queue | GitHub's added event | Merged, or removed |
+| Out of the queue | Removed for any reason but the merge (GitHub's reason is kept) | Added again |
 
-The three SHAs are facts, not keys: source (`test_sha`, and the exporter's `head_sha` for the commit a job really ran), harness (`test_infra_sha`) and workflow (`test_infra_workflow_sha`). Suite has three different meanings in three stores and must not be a join key.
+A push after the approval sends the pull request back to Waiting for a reviewer when GitHub dismissed the approval, or when an approval follows before the next queue entry: that is a re-review. A change request holds it there until the same reviewer approves.
 
-The exporter is the workflow-exporter service on the central machine. It polls GitHub and keeps job and step history in SQLite for 60 days.
+**Working groups to approve** are the code-owner teams GitHub reports: the teams each review was made on behalf of, plus the code-owner review requests still pending. GitHub keeps no list of a requirement once it is met, so it is read from who approved for whom, not computed from CODEOWNERS. `maintainers`, the parent of the `wg-*` teams, adds nothing next to a working group; alone it counts as one (any working group). A team review requested by hand reads the same as a code-owner request once that team reviewed.
 
-## The sources
+A **review round** is one version of the code that got a human review (a review records the commit it looked at, which survives a rebase). A **re-approval** is an approval by a reviewer, or for a team, that had approved an earlier version; it follows a rebase when a force push came between the two. Pushes come from the commits on the branch now and GitHub's force-push events: a rebase replaces the commits, so the pushes before the last rebase show only as that force push.
 
-Each question has one authoritative store. [sources.md](sources.md) maps every question to its source, its retention and whether it covers a single run or the whole population. When two stores can answer, that table says which one wins.
+A queue attempt ends **ejected** when its own merge_group runs failed or timed out (explained by the GitHub comment when one exists), **re-queued** when it was cancelled or replaced by a later attempt (every entry behind a failing one is, and so is an entry whose pull request got a new push or was taken out by hand), and **passed** otherwise. The attempts are derived from the runs; the removals and their reasons in the event list are GitHub's own. An open pull request is read from GitHub when the page loads.
 
-## Where the code lives
+## All runs
 
-`monitoring/` owns the central stack: the backend, the Grafana provisioning and the cluster manifests for the in-cluster collectors. Two CI hooks sit outside it:
+One table of runs with repository, suite and result filters and a filter on every column. **Cause** is the cause Why runs fail counts. A run with no recording opens GitHub.
 
-- **The capture action**, `.github/actions/ci-observe-capture/action.yml`. A workflow calls a local action by path, so it lives beside the workflows that use it. It deploys the collectors from `monitoring/config/ci-observe/`, runs the test command, and verifies that telemetry reached the backend.
-- **The gather script**, `scripts/gather-osac-logs.sh`, wrapped by `.github/actions/collect-artifacts/`. It runs on the runner against the live test cluster and collects the failure evidence that becomes the GitHub artifact.
+## E2E run
 
-Both run on the runner as part of a workflow or its failure path, not on the central machine. `monitoring/` still owns the configs they deploy and the backend they push to.
+| Section | Contents |
+|---|---|
+| Summary | Result, tests run, test time, where the run's time went (one bar per suite), time to result, wait for a runner. |
+| Failures | Failed tests, error messages, test time, the artifact. |
+| Jobs and steps | Every job and step with its duration. A job name opens its suite's Where the time goes. |
+| Test list | Every test with its setup, waiting, actions and teardown. |
+| Run info | Run, pull request, workflow, commit and test paths, as links. |
+| Cluster | Pods, CPU and memory by pod, node CPU and memory. |
+| Waits, fixtures and the step timeline | Every wait and fixture setup of the trace; every step with its start after the first job was created. |
 
-## The two populations
+## Keys
 
-Trends reads two populations, and they are never drawn on one axis:
+A run is keyed by its GitHub run id; a recording id adds the suite and rerun number. A pull request is keyed by repository and number. A test is keyed by its canonical name. A capture id joins a run to its trace, span rollup, logs and cluster metrics.
 
-| Population | Source | Retention | Counts |
-|---|---|---|---|
-| All CI jobs | workflow exporter (SQLite) | 60 days | Every run, captured or not |
-| Captured runs | Tempo, Prometheus, Loki | 30 days traces, 15 days metrics | Runs with telemetry, for detail |
+## Data limits
 
-A rate, count or duration names its population and its window in the panel title: `pass rate, all jobs, 60 days` or `pass rate, captured runs, 30 days`.
+- The run archive (suite runs and their job timelines), the test results, the span rollup and the pull request history are kept for 90 days (`CI_OBSERVE_KEEP_DAYS`).
+- The workflow exporter keeps its own job history for 30 days. GitHub keeps the JUnit artifact for 30 days, so a run's tests are read within that window.
+- The exporter fetches the job timeline (needed for the wait for a runner and for timeouts) of a run stored before timelines existed a few runs per poll, counted suite runs only, newest first.
+- Tempo keeps traces for 30 days; the span rollup reads a run once, 20 minutes after it finished.
+- Prometheus and Loki keep cluster data for 30 days.
 
-Captures are opt-in, so a per-test trend over captures describes the runs someone instrumented, not the test population.
+## Known gaps
 
-## Capture: one CI run
+No Kubernetes events, no per-test trace links, no service call summary, no CI SLO targets or alerts, no capture coverage target and no telemetry pipeline health. The product's own work is seen through the tests' waits, not from OSAC's controllers. [`observability.md`](observability.md) lists the impact and the planned order.
 
-The unit is one capture. The axis is time inside the run, bounded by the capture's `started_at` and `ended_at`. A capture states which layers arrived before it shows their contents.
+## Out of scope
 
-| Layer | Data | Question |
-|---|---|---|
-| Verdict | passed, failed, cancelled, or not collected; collection coverage; then session span, failed tests, JUnit | Did it pass, what failed, and did we record it? |
-| CI | job, steps, artifacts | Where did CI spend its time, and what did it gather? |
-| Test | pytest spans, phases, waits, polls | What was the test doing? |
-| Service | Beyla spans | What did the OSAC services do? |
-| Environment | pod and node metrics, events, pod lifecycle | What was the cluster doing? |
-
-The Capture page holds one section per layer: Run overview and Collection coverage for the verdict, CI evidence for the CI layer (GitHub jobs, steps, the JUnit result, the failed tests and the artifact link), Run identity for the SHAs and image refs, Tests and workers, Fixture work and Waits for the test layer, Service requests for the service layer, and Environment for the pod and node metrics. The Events row reads the Kubernetes events stored in Loki.
-
-The moment of failure is one vertical marker on every chart. It is derived from the end of the failed span, not stored, so it is exact on trace panels and within one minute on cluster panels.
-
-The CI evidence section carries the failed tests, the JUnit result and a link to the run's artifact. The artifact is the evidence bundle: the per-test `failure.json`, the pod logs and the cluster snapshots. GitHub deletes it after 7 days, so the page links to it rather than copying it. Pod logs exist only in that artifact: the collector cannot read `/var/log/pods`, so Loki holds no pod logs.
-
-Runtime image IDs come from every Deployment in the observed namespace. A capture proves the running bytes when it lists an ID for every Deployment container and `osac_image_ids_complete` is `true`. Captures recorded before the namespace fix keep `unknown`; they are never rewritten.
-
-A run that produced no capture still appears in the index with verdict `not collected` and a link to GitHub. Otherwise the front door is blind exactly when ingest is broken.
-
-## Pull requests: the life of a change
-
-The unit is one pull request. The axis is calendar time from open to merge or close.
-
-| Stage | From | To | Data |
-|---|---|---|---|
-| Authoring | PR opened | first review | PR timeline, commits |
-| Review | first review | approval | reviews, review comments |
-| Waiting | approval | queue entry | labels, required checks |
-| Queue | enqueued | merge or ejection | merge_group runs, queue events, ejection reasons |
-| Merged | last attempt | merge | PR merge event |
-
-`Enqueued` means the start of the pull request's first `merge_group` run. GitHub exposes no durable enqueue timestamp, so the run start is the only reproducible choice. Runner queue wait is a different thing: it belongs to Fleet and is linked, not folded into this stage.
-
-An **ejection** is a pull request leaving the merge queue without merging. It is derived from a failed `merge_group` run plus the comment GitHub leaves on the PR.
-
-For each stage: duration, the attempts inside it, and why an attempt was ejected. Every queue attempt links to its run. The link opens the Capture dashboard when a capture exists, and the GitHub job when it does not.
-
-The dashboard opens on an index: recent pull requests with their last stage and age. Without it the page would be reachable only by already knowing the PR number.
-
-The queue stage needs its own unit. One `merge_group` run can carry up to four pull requests, and a queue run has neither a PR number nor a capture. The run is the unit; the PR links come from the `gh-readonly-queue` branch name and from queue comments that name a run. A separate queue-workflow change would give a queue run its PR number and a capture, which means enabling `ci-observe` there.
-
-## Trends: test history, compare, overview
-
-| Section | Population | Question |
-|---|---|---|
-| Test history | all jobs for outcomes, captured runs for duration | Is this test flaky, slower, or newly broken? |
-| Compare | a cohort of captured runs | Did these runs differ, and by how much? |
-| Overview | all jobs for a suite or a ref | What is the pass rate, duration and failure mix? |
-
-The cohort is chosen in the Compare section, and its tables rank tests by observed test-span time and list what failed.
-
-**Flaky** means the same test passed and failed on the same source SHA. Test history counts distinct source SHAs with both outcomes over 60 days, from all jobs. Reruns of the same SHA do not add to that count. **Slower** is a duration trend over the same window, from captured runs. **Newly broken** is consecutive failures on the most recent SHAs with no pass between them.
-
-## Compare is an action in Trends
-
-Compare is a section of Trends, not a dashboard. It is an action on a capture (`compare with its baseline`), on a pull request (`compare this attempt with the last green one`) and on a test row (`compare the last two runs`).
-
-The **baseline** is the most recent cohort with the same source, harness and workflow SHAs and at least two captures. When none exists, the baseline is the last three captures of the same suite before this one. The action seeds the cohort from the unit's own identity fields, so no one types SHAs by hand, and lands the reader in the Compare section of Trends.
-
-## Entry and navigation
-
-The entry page is the router described under [Starting a task](#starting-a-task). Every link between dashboards carries the unit and the time range, so the reader never loses their place:
-
-- Capture to its ref, and to `compare with baseline`.
-- Capture back to the entry page with the run's time range, not "now".
-- Pull request to its attempts, and each attempt to its run or its GitHub job.
-- Trends to the runs behind a point, and back to the trend that sent them.
-
-The clock bridge is the capture's `started_at` and `ended_at`. It is the only mapping between time inside a run and calendar time.
-
-## Missing and partial telemetry
-
-These are normal states, not errors:
-
-- A run with no capture: shown as `not collected`, links to GitHub.
-- A capture missing a layer: its coverage strip says which layers arrived.
-- A cancelled run: its own verdict, not a failure.
-- Tempo lag for a fresh capture: shown as "not indexed yet", not "missing".
-- A pull request whose queue history predates the data: shown as "no queue history", not "no ejections".
-
-## Attempts, pushes and reruns
-
-Three different things, and each has a key:
-
-| Event | Key | New capture? | Counts toward flake? |
-|---|---|---|---|
-| A push | new source SHA | yes, a new run | yes, a new SHA |
-| A queue attempt | new workflow run | yes, a new run | yes, if it has a new SHA |
-| A rerun | same run id, new attempt | yes, a new capture, `-a2` | no, same SHA |
-
-## The rule
-
-A panel belongs to exactly one dashboard, names its unit and its population, and sits on that unit's timeline or time range.
-
-If a panel cannot name its unit and its axis, it is not ready to be built.
-
-## The pile test
-
-Before adding a panel or a dataset, answer four questions:
-
-1. Which unit is this about?
-2. What is its time axis?
-3. Which dashboard does it join?
-4. Does it link to the other units?
-
-Four answers, or it is not admitted.
-
-## What is out of scope
-
-Fleet health: runners, machines, queue infrastructure and exporter health. It is a different product with a different unit. It stays in its own Grafana folder, `CI Fleet`, and may be linked from ci-observe. Runner queue wait stays in Fleet; the Pull requests dashboard links to it rather than copying it.
-
-In scope, and easily confused with it: the merge queue of a pull request. That is a stage of the Pull requests dashboard.
-
-## Constraints the model must respect
-
-- **Pod logs are not delivered to Loki.** The collector is configured for `/var/log/pods`, but the unprivileged UID cannot read it, so pod logs exist only in the 7-day artifact.
-- **Runtime image IDs are `unknown` in current captures.** The requested image refs are recorded; the running image bytes are not. A capture that lists an ID for every OSAC Deployment container with `osac_image_ids_complete=true` is what proves the path works.
-- **GitHub keeps no merge-queue history.** An ejected entry disappears. An ejection is derived from a failed `merge_group` run plus the pull request comment. Exact events need a webhook receiver.
-- **Tempo keeps 30 days and rejects queries over 7 days.** A 30-day per-test trend needs a daily rollup of counts and percentiles, not a longer query. The run index and capture discovery read the `captures` registry, not Tempo; the Capture view uses one tight-window search and trace-by-id.
-- **The exporter polls GitHub every 90 seconds and the capture registry every 60 seconds.** PR history is an hourly incremental pass plus a daily full pass, not a re-poll of every cycle.
-- **Label and review-request history exists only in the PR timeline.** The PR object carries current state only.
-
-## How new data is admitted
-
-A new dataset enters only if it joins a unit by an existing key, or by a key that the same change introduces on both sides.
-
-- Adapter request logs join a capture by capture id and a time.
-- Router logs join a capture by capture id and a time, if the gather step stamps them.
-- Pod restart history joins a capture by capture id and a time.
-- Kubernetes events join a capture by capture id and a time.
-- PR reviews join a pull request by PR number.
-- Queue events join a pull request by PR number and a workflow run.
-
-Data that only describes the fleet is not admitted.
-
-## What exists, and what is next
-
-1. The Grafana folder is split: `CI Fleet` and `ci-observe`.
-2. The entry page routes a run id, a capture id, a pull request number or a test id, with the run index behind an empty input.
-3. Capture is one page: one section per layer, one timeline, no new data.
-
-Next: runtime image IDs that resolve in a live capture, router access logs when the ingress controller writes them to Container, and the queue-workflow change that gives a `merge_group` run its PR number and capture.
+Fleet health (runners, machines, queue infrastructure) belongs to the **CI Fleet** folder. Netris, stretched, full regression, unit and integration tests are not ci-observe.
