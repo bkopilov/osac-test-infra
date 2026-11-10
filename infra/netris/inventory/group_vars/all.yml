@@ -308,6 +308,8 @@ ocp_vmaas_external_ip_tests_enabled: false
 ocp_evpn_vtep_cidr: "198.18.0.0/24"
 ocp_evpn_vtep_node_ip_cidr: "198.18.0.1/32"
 ocp_evpn_vtep_dummy_interface: "evpn-vtep0"
+# Opt in to FRR IPv4 multipath for EVPN routes; false preserves chart defaults.
+ocp_evpn_bgp_active_active: false
 
 # ── Netris Fabric Manager (VMaaS, OSAC networking contract) ──────────
 # Suites whose NetworkClass selects the cudn_evpn Kubernetes Manager. The

@@ -9,6 +9,9 @@ evpn:
     asn: {{ ocp_underlay_ocp_asn | int }}
     acceptPrefixes:
       - {{ ocp_evpn_netris_loopback_cidr | to_json }}
+{% if ocp_evpn_bgp_active_active | default(false) | bool %}
+    activeActive: true
+{% endif %}
     waitForEstablished: true
     timeoutSeconds: 900
 {% if ocp_evpn_bfd_profile | default('') | trim | length > 0 %}

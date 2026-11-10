@@ -388,6 +388,7 @@ catalog and `all.yml` list different keys.
 | `ocp_evpn_vtep_cidr` | `198.18.0.0/24` | `configure-cudn-evpn` |
 | `ocp_evpn_vtep_node_ip_cidr` | `198.18.0.1/32` | `configure-cudn-evpn` |
 | `ocp_evpn_vtep_dummy_interface` | `evpn-vtep0` | `configure-cudn-evpn` |
+| `ocp_evpn_bgp_active_active` | `false` | `configure-cudn-evpn` |
 | `ocp_evpn_bfd_profile` | empty (disabled) | `configure-cudn-evpn` |
 | `ocp_evpn_bfd_receive_interval_ms` | `300` | `configure-cudn-evpn` |
 | `ocp_evpn_bfd_transmit_interval_ms` | `300` | `configure-cudn-evpn` |
