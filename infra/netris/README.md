@@ -292,16 +292,18 @@ underlay. Leave this setting false for the existing numbered `/31` contract.
 Active/backup EVPN uplinks are opt-in and mutually exclusive with
 `ocp_evpn_bgp_active_active`. Set `ocp_evpn_bgp_active_backup=true` and point
 the backup link at a second underlay-enabled port on a different leaf:
-`ocp_evpn_backup_interface` (`eth12`), `ocp_evpn_backup_leaf_index` (`0`) and
-`ocp_evpn_backup_p2p_cidr` (`192.0.3.0/30`, leaf `.1`, OCP `.2`). The generated
+`ocp_evpn_backup_interface` (`eth12`), `ocp_evpn_backup_leaf_port` (`swp1s2`),
+`ocp_evpn_backup_leaf_index` (`0`) and `ocp_evpn_backup_p2p_cidr`
+(`192.0.3.0/30`, leaf `.1`, OCP `.2`). The generated
 `.evpn-values.yaml` sets `activeBackup: true` and tags the primary uplink
 `active` and the backup uplink `backup`, so the installer renders
 `local-preference 200` on the active peer and `local-preference 100` plus a
 triple AS-path prepend on the backup peer. IPv4 unicast still accepts only the
 reserved VTEP loopbacks through the generated prefix list, while the L2VPN EVPN
 address family stays unfiltered. Unnumbered BGP applies to both uplinks when it
-is enabled. The lab topology change that wires `eth12` to `ns-leaf-0 swp1s2`
-with underlay enabled is required before enabling this mode.
+is enabled. When the mode is enabled, `deploy-infra` also wires `eth12` to
+`ns-leaf-0 swp1s2` with underlay enabled and moves h02's leaf-0 link to
+`swp2s0`; the default single-uplink topology is unchanged.
 
 Netris/CUDN EVPN settings are overlays inside the existing OSAC service profile
 directories: `osac-installer/values/vmaas-ci/netris.yaml`,

@@ -172,10 +172,12 @@ resource "netris_softgate" "north-south-softgate" {
 #### Declaration of North-South Fabric links ####
 
 #GPU server links to NS Leaf switches
+# With EVPN active-backup enabled, h02's leaf-0 link moves from swp1s2 to
+# swp2s0 so swp1s2 is free for h00 eth12's dedicated backup underlay link.
 resource "netris_link" "north-south-leaf-to-gpu-server" {
   count                           = (var.north-south-fabric.enable * var.gpu-server-count * 2)
   ports                           = [
-                                      "swp${ (  floor ( (floor(count.index/2) -  ( (var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4)))) / var.north-south-fabric.leaf-port-breakout )+1  )}s${(floor(count.index/2) - ((var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4)))) - var.north-south-fabric.leaf-port-breakout*floor((floor(count.index/2) - ((var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4))))/var.north-south-fabric.leaf-port-breakout) }@${netris_switch.north-south-leaf[(count.index - (2*floor(count.index/2)) + (2*(floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4) )) ) )].name}",
+                                      {% if ocp_evpn_bgp_active_backup | default(false) | bool %}count.index == 4 ? "swp2s0@${netris_switch.north-south-leaf[0].name}" : {% endif %}"swp${ (  floor ( (floor(count.index/2) -  ( (var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4)))) / var.north-south-fabric.leaf-port-breakout )+1  )}s${(floor(count.index/2) - ((var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4)))) - var.north-south-fabric.leaf-port-breakout*floor((floor(count.index/2) - ((var.gpu-server-count/var.north-south-fabric.leaf-count*2) * floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4))))/var.north-south-fabric.leaf-port-breakout) }@${netris_switch.north-south-leaf[(count.index - (2*floor(count.index/2)) + (2*(floor(count.index/(var.gpu-server-count/var.north-south-fabric.leaf-count*4) )) ) )].name}",
                                       "eth${(count.index - (2*floor(count.index/2)) + local.gpu-server-first-ns-port)}@${netris_server.hgx[(floor(count.index/2))].name}"
   ]
   ipv4                            = [
@@ -203,7 +205,26 @@ resource "netris_link" "north-south-leaf-to-gpu-server" {
 # a separate VLAN-backed netris_bgp resource on this routed point-to-point link.
 
 
-#Leaf to Spine links
+{% if ocp_evpn_bgp_active_backup | default(false) | bool %}# Dedicated second OCP underlay for EVPN active-backup: h00 eth12 <-> ns-leaf-0
+# swp1s2 with underlay enabled, so Netris generates the backup E-BGP peer.
+resource "netris_link" "north-south-leaf-to-hgx-h00-backup" {
+  count                           = var.north-south-fabric.enable
+  ports                           = [
+                                      "{{ ocp_evpn_backup_leaf_port }}@${netris_switch.north-south-leaf[{{ ocp_evpn_backup_leaf_index | int }}].name}",
+                                      "{{ ocp_evpn_backup_interface }}@${netris_server.hgx[0].name}"
+  ]
+  ipv4                            = [
+                                      "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('1') }}",
+                                      "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('2') }}"
+  ]
+  underlay                        = "enabled"
+  depends_on                      = [
+                                      netris_link.north-south-leaf-to-gpu-server
+  ]
+}
+
+
+{% endif %}#Leaf to Spine links
 resource "netris_link" "north-south-leaf-to-spine" {
   count                           = (var.north-south-fabric.enable * var.north-south-fabric.leaf-count * var.north-south-fabric.spine-count * var.north-south-fabric.leaf-to-spine-link-count)
   ports                           = [
