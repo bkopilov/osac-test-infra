@@ -401,6 +401,60 @@
           No cluster configuration was changed.
       tags: [cudn_evpn]
 
+    - name: Reject conflicting EVPN multipath modes
+      ansible.builtin.assert:
+        that:
+          - not (ocp_evpn_bgp_active_active | default(false) | bool and
+                 ocp_evpn_bgp_active_backup | default(false) | bool)
+        fail_msg: >-
+          ocp_evpn_bgp_active_active and ocp_evpn_bgp_active_backup are
+          mutually exclusive; enable at most one. No cluster configuration was
+          changed.
+      tags: [cudn_evpn]
+
+    - name: Derive the active-backup underlay endpoint and leaf ASN
+      ansible.builtin.set_fact:
+        _ocp_evpn_backup_ocp_cidr: "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('2') }}"
+        _ocp_evpn_backup_ocp_ip: "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('2') | ansible.utils.ipaddr('address') }}"
+        _ocp_evpn_backup_leaf_ip: "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}"
+        _ocp_evpn_backup_leaf_asn: "{{ (ocp_evpn_netris_leaf_asn_start | int) + (ocp_evpn_backup_leaf_index | int) }}"
+      when: ocp_evpn_bgp_active_backup | default(false) | bool
+      changed_when: false
+      tags: [cudn_evpn]
+
+    - name: Validate the active-backup EVPN uplink
+      ansible.builtin.assert:
+        that:
+          - ocp_evpn_backup_interface is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - ocp_evpn_backup_interface != ocp_underlay_guest_interface
+          - ocp_evpn_backup_interface != ocp_underlay_management_interface
+          - ocp_evpn_backup_interface != ocp_data_guest_interface
+          - ocp_evpn_backup_p2p_cidr | ansible.utils.ipv4('net') | default('', true) | length > 0
+          - ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('prefix') | int == 30
+          - ocp_evpn_backup_leaf_index | int >= 0
+          - ocp_evpn_backup_leaf_index | int < ocp_evpn_netris_leaf_count | int
+          - ocp_evpn_backup_leaf_index | int != ocp_underlay_leaf_index | int
+          - _ocp_evpn_backup_leaf_ip != _ocp_evpn_backup_ocp_ip
+          - _ocp_evpn_backup_leaf_asn | int > 0
+          - _ocp_evpn_backup_leaf_asn | int < 4294967295
+          - _ocp_evpn_backup_leaf_asn | int != ocp_underlay_ocp_asn | int
+          - _ocp_evpn_backup_leaf_asn | int != _ocp_evpn_leaf_asn | int
+          - not (ocp_evpn_backup_p2p_cidr | ansible.utils.network_in_network(ocp_underlay_p2p_cidr))
+          - not (ocp_underlay_p2p_cidr | ansible.utils.network_in_network(ocp_evpn_backup_p2p_cidr))
+          - not (ocp_evpn_backup_p2p_cidr | ansible.utils.network_in_network(ocp_evpn_vtep_cidr))
+          - not (ocp_evpn_vtep_cidr | ansible.utils.network_in_network(ocp_evpn_backup_p2p_cidr))
+        fail_msg: >-
+          The active-backup uplink needs a distinct IPv4 /30 peer network on a
+          second underlay-enabled port whose leaf differs from the active leaf,
+          and it must not overlap the active /31 or the reserved VTEP range.
+          Observed interface={{ ocp_evpn_backup_interface }},
+          network={{ ocp_evpn_backup_p2p_cidr }},
+          leaf index={{ ocp_evpn_backup_leaf_index }},
+          leaf ASN={{ _ocp_evpn_backup_leaf_asn }}.
+          No cluster configuration was changed.
+      when: ocp_evpn_bgp_active_backup | default(false) | bool
+      tags: [cudn_evpn]
+
     - name: Write EVPN values for the OSAC installer
       ansible.builtin.template:
         src: evpn-infra-values.yaml.j2

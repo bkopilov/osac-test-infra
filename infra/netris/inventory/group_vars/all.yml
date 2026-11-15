@@ -310,6 +310,16 @@ ocp_evpn_vtep_node_ip_cidr: "198.18.0.1/32"
 ocp_evpn_vtep_dummy_interface: "evpn-vtep0"
 # Opt in to FRR IPv4 multipath for EVPN routes; false preserves chart defaults.
 ocp_evpn_bgp_active_active: false
+# Opt in to active/backup EVPN uplinks. Mutually exclusive with
+# ocp_evpn_bgp_active_active. The primary underlay uplink stays active; the
+# backup uplink below is installed as the standby path: the installer sets
+# local-preference 100 instead of 200 and prepends the node ASN three times on
+# egress. The backup link must be a second underlay-enabled port on another
+# leaf (`eth12` <-> `ns-leaf-0 swp1s2` in this lab).
+ocp_evpn_bgp_active_backup: false
+ocp_evpn_backup_interface: "eth12"
+ocp_evpn_backup_leaf_index: 0
+ocp_evpn_backup_p2p_cidr: "192.0.3.0/30"
 
 # ── Netris Fabric Manager (VMaaS, OSAC networking contract) ──────────
 # Suites whose NetworkClass selects the cudn_evpn Kubernetes Manager. The
