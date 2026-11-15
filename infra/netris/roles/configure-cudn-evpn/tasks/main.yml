@@ -426,9 +426,13 @@
       ansible.builtin.assert:
         that:
           - ocp_evpn_backup_interface is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - ocp_evpn_backup_interface is not match('^(br-|ovn-|genev_)')
+          - ocp_evpn_backup_interface not in ['lo', 'br-ex', 'br-int']
           - ocp_evpn_backup_interface != ocp_underlay_guest_interface
           - ocp_evpn_backup_interface != ocp_underlay_management_interface
           - ocp_evpn_backup_interface != ocp_data_guest_interface
+          - ocp_evpn_backup_interface != ocp_evpn_vtep_dummy_interface
+          - ocp_evpn_backup_leaf_port is match('^swp[0-9]+s[0-9]+$')
           - ocp_evpn_backup_p2p_cidr | ansible.utils.ipv4('net') | default('', true) | length > 0
           - ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('prefix') | int == 30
           - ocp_evpn_backup_leaf_index | int >= 0
