@@ -70,7 +70,6 @@
     ocp_underlay_uplink_mac: "{{ (_ocp_uplink_resolve.stdout | from_json).underlay_guest_mac | default('') }}"
     ocp_underlay_server_port_resolved: "{{ (_ocp_uplink_resolve.stdout | from_json).underlay_server_port | default('') }}"
     ocp_evpn_backup_guest_mac: "{{ (_ocp_uplink_resolve.stdout | from_json).backup_guest_mac | default('') }}"
-    ocp_evpn_backup_server_port_resolved: "{{ (_ocp_uplink_resolve.stdout | from_json).backup_server_port | default('') }}"
 
 - name: Build the single OCP VNet port
   ansible.builtin.set_fact:
