@@ -314,10 +314,15 @@ dedicated `EVPN-ACTIVE-IN`/`EVPN-ACTIVE-OUT` and
 `EVPN-BACKUP-IN`/`EVPN-BACKUP-OUT` route-maps. Unnumbered BGP applies to both
 uplinks when it is enabled, and frr-k8s's generated IPv6 deny prefix-lists stay
 in place: they only filter IPv6 unicast routes, so IPv4 routes and their IPv6
-link-local next hops are unaffected. When the mode is enabled, `deploy-infra` also wires `eth12` to
-`ns-leaf-0 swp1s2` with underlay enabled and moves h02's leaf-0 link to
-`swp2s0`; the default single-uplink topology is unchanged. The role resolves
-the backup guest Linux interface name from the Netris port's MAC, just like
+link-local next hops are unaffected. When the mode is enabled, `deploy-infra`
+wires the selected backup endpoint with underlay enabled. If a server link
+already occupies that leaf port, it moves to the first free server-facing
+port below the fabric uplink ranges. With the defaults this moves h02's
+leaf-0 link to `swp2s0`; larger server counts and backup-port overrides use
+the actual port occupancy. The topology rejects taking h00's existing leaf
+endpoints, invalid fabric endpoints, and configurations with no spare port
+for a displaced link. The role resolves the backup guest Linux interface
+name from the Netris port's MAC, just like
 the data and primary underlay interfaces, so the generated values do not
 depend on guest NIC enumeration.
 

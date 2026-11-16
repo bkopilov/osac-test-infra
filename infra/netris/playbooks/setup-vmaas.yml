@@ -195,6 +195,9 @@
         _vmaas_active_backup: "{{ ocp_evpn_bgp_active_backup | default(false) | bool }}"
         _vmaas_unnumbered: "{{ ocp_evpn_bgp_unnumbered | default(false) | bool }}"
         _vmaas_expected_neighbor_count: "{{ 2 if (ocp_evpn_bgp_active_backup | default(false) | bool) else 1 }}"
+
+    - name: Collect the expected numbered EVPN peer identities
+      ansible.builtin.set_fact:
         _vmaas_expected_peer_ips: >-
           {{ [_vmaas_leaf_peer_ip]
              + ([_vmaas_backup_leaf_peer_ip] if (ocp_evpn_bgp_active_backup | default(false) | bool) else []) }}
