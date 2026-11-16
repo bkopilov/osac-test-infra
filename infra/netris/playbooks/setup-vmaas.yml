@@ -404,30 +404,31 @@
     - name: Require the active-backup EVPN neighbor policy
       ansible.builtin.assert:
         that:
-          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-ACTIVE-IN in') in _vmaas_evpn_raw"
-          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-ACTIVE-OUT out') in _vmaas_evpn_raw"
-          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-IPV4-BACKUP-IN in') in _vmaas_evpn_raw"
-          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-IPV4-BACKUP-OUT out') in _vmaas_evpn_raw"
+          - "('route-map ' ~ _vmaas_peer_ids[0] ~ '-in permit 1') in _vmaas_evpn_raw"
+          - "('route-map ' ~ _vmaas_peer_ids[1] ~ '-in permit 1') in _vmaas_evpn_raw"
+          - "('route-map ' ~ _vmaas_peer_ids[1] ~ '-out permit 1') in _vmaas_evpn_raw"
           - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-ACTIVE-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-ACTIVE-OUT out') in _vmaas_evpn_raw"
           - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-IN in') in _vmaas_evpn_raw"
           - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-OUT out') in _vmaas_evpn_raw"
           - (_vmaas_frr_neighbors[1].asn | int) == ((_vmaas_frr_neighbors[0].asn | int) + ((ocp_evpn_backup_leaf_index | int) - (ocp_underlay_leaf_index | int)))
         fail_msg: >-
           ocp_evpn_bgp_active_backup is enabled but the host EVPN rawConfig
-          does not apply the active/backup IPv4 and L2VPN EVPN route-maps to
-          {{ _vmaas_peer_ids | join(' (active) / ') }}, or the backup neighbor
-          ASN does not match its leaf index.
+          does not merge the active/backup IPv4 local-preference entries into
+          the frr-k8s generated route-maps, does not apply the L2VPN EVPN
+          route-maps to {{ _vmaas_peer_ids | join(' (active) / ') }}, or the
+          backup neighbor ASN does not match its leaf index.
       when: _vmaas_active_backup | bool
 
-    - name: Require the unnumbered IPv4 unicast route-maps
+    - name: Require the unnumbered IPv4 unicast policy to stay with frr-k8s
       ansible.builtin.assert:
         that:
-          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-IN in') in _vmaas_evpn_raw"
-          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-OUT out') in _vmaas_evpn_raw"
+          - "'ipv6 prefix-list' not in _vmaas_evpn_raw"
+          - "'route-map' not in _vmaas_evpn_raw"
         fail_msg: >-
-          An unnumbered EVPN neighbor must use the chart-owned IPv4 unicast
-          route-maps so IPv6 link-local next hops are never evaluated against
-          the frr-k8s-generated IPv6 prefix-lists.
+          An unnumbered EVPN neighbor must rely on the frr-k8s generated
+          <peer>-in/<peer>-out IPv4 unicast route-maps. The chart must not add
+          IPv6 prefix-lists or route-maps of its own for that neighbor.
       when:
         - _vmaas_unnumbered | bool
         - not (_vmaas_active_backup | bool)

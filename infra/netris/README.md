@@ -288,12 +288,12 @@ Unnumbered BGP is also opt-in. Set `ocp_evpn_bgp_unnumbered=true` when running
 configures FRR to peer by the local interface name. The matching fabric port
 must already support unnumbered BGP and provide the required link-local
 underlay. Leave this setting false for the existing numbered `/31` contract.
-For unnumbered neighbors the installer also attaches its own `EVPN-IPV4-IN`
-and `EVPN-IPV4-OUT` route-maps to the `address-family ipv4 unicast` neighbor,
-so IPv4 next hops are resolved from the learned IPv6 link-local address
-without being filtered. frr-k8s still generates its
-`<peer>-allowed-ipv6`/`<peer>-inpl-dual` deny prefix-lists; leave them in
-place, they are never evaluated for those IPv4 unicast routes.
+For unnumbered neighbors the IPv4 unicast policy comes from the frr-k8s
+generated `<peer>-in`/`<peer>-out` route-maps for the interface, which are the
+only ones FRR keeps attached in `address-family ipv4 unicast`. frr-k8s still
+generates its `<peer>-allowed-ipv6`/`<peer>-inpl-dual` deny prefix-lists;
+leave them in place. They filter IPv6 unicast routes only, so neither the RFC
+5549 IPv4 routes nor their IPv6 link-local next hops are affected by them.
 
 Active/backup EVPN uplinks are opt-in and mutually exclusive with
 `ocp_evpn_bgp_active_active`. Set `ocp_evpn_bgp_active_backup=true` and point
@@ -304,13 +304,17 @@ the backup link at a second underlay-enabled port on a different leaf:
 `.evpn-values.yaml` sets `activeBackup: true` and tags the primary uplink
 `active` and the backup uplink `backup`, so the installer renders
 `local-preference 200` on the active peer and `local-preference 100` plus a
-triple AS-path prepend on the backup peer. IPv4 unicast still accepts only the
-reserved VTEP loopbacks through the installer's `EVPN-IPV4-ACTIVE-*` and
-`EVPN-IPV4-BACKUP-*` prefix lists, while the L2VPN EVPN address family stays
-unfiltered. Unnumbered BGP applies to both uplinks when it is enabled, and the
-route-maps are attached to each neighbor in `address-family ipv4 unicast`, so
-frr-k8s's generated IPv6 deny prefix-lists stay in place without blocking the
-IPv6 link-local next hop. When the mode is enabled, `deploy-infra` also wires `eth12` to
+triple AS-path prepend on the backup peer. frr-k8s attaches its own per-neighbor
+`<peer>-in`/`<peer>-out` maps in `address-family ipv4 unicast` and applies them
+after the chart's raw block, so the installer merges a `permit 1` entry into
+those generated maps: the inbound entry matches the reserved VTEP loopbacks
+(`EVPN-REMOTE-VTEPS`) and sets local preference 200/100, and the backup
+outbound entry prepends the node ASN. The L2VPN EVPN address family uses
+dedicated `EVPN-ACTIVE-IN`/`EVPN-ACTIVE-OUT` and
+`EVPN-BACKUP-IN`/`EVPN-BACKUP-OUT` route-maps. Unnumbered BGP applies to both
+uplinks when it is enabled, and frr-k8s's generated IPv6 deny prefix-lists stay
+in place: they only filter IPv6 unicast routes, so IPv4 routes and their IPv6
+link-local next hops are unaffected. When the mode is enabled, `deploy-infra` also wires `eth12` to
 `ns-leaf-0 swp1s2` with underlay enabled and moves h02's leaf-0 link to
 `swp2s0`; the default single-uplink topology is unchanged. The role resolves
 the backup guest Linux interface name from the Netris port's MAC, just like
