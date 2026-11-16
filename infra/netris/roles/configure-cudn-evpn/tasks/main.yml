@@ -464,6 +464,7 @@
           - ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('prefix') | int == 30
           - ocp_evpn_backup_leaf_index | int >= 0
           - ocp_evpn_backup_leaf_index | int < ocp_evpn_netris_leaf_count | int
+          - ocp_evpn_backup_leaf_index_resolved | int == ocp_evpn_backup_leaf_index | int
           - ocp_evpn_backup_leaf_index | int != ocp_underlay_leaf_index | int
           - _ocp_evpn_backup_leaf_ip != _ocp_evpn_backup_ocp_ip
           - _ocp_evpn_backup_leaf_asn | int > 0
@@ -482,6 +483,7 @@
           guest interface={{ ocp_evpn_backup_guest_interface }},
           network={{ ocp_evpn_backup_p2p_cidr }},
           leaf index={{ ocp_evpn_backup_leaf_index }},
+          resolved leaf={{ ocp_evpn_backup_leaf | default('') }},
           leaf ASN={{ _ocp_evpn_backup_leaf_asn }}.
           No cluster configuration was changed.
       when: ocp_evpn_bgp_active_backup | default(false) | bool

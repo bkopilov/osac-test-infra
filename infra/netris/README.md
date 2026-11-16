@@ -342,7 +342,8 @@ endpoints, invalid fabric endpoints, and configurations with no spare port
 for a displaced link. The role resolves the backup guest Linux interface
 name from the Netris port's MAC, just like
 the data and primary underlay interfaces, so the generated values do not
-depend on guest NIC enumeration.
+depend on guest NIC enumeration. It also rejects a resolved backup port whose
+Netris link lands on a leaf other than `ocp_evpn_backup_leaf_index`.
 
 Netris/CUDN EVPN settings are overlays inside the existing OSAC service profile
 directories: `osac-installer/values/vmaas-ci/netris.yaml`,

@@ -234,6 +234,7 @@ def verified_uplinks(args: argparse.Namespace, names: list[str], vm: str, known_
         verified[server_port] = {
             "guest_mac": peers[0][0]["mac"],
             "leaf_port": leaf_endpoint,
+            "leaf_vm": endpoint["leaf_vm"],
             "underlay": endpoint["underlay"],
         }
     mac_to_ports: dict[str, list[str]] = {}
@@ -338,9 +339,17 @@ def resolve(args: argparse.Namespace) -> dict:
             }
         )
     if backup_uplink is not None:
+        leaf_match = re.fullmatch(r"ns-leaf-(\d+)", backup_uplink["leaf_vm"])
+        if not leaf_match:
+            raise UplinkError(
+                f"Configured Netris backup port {backup_port} maps to unexpected leaf "
+                f"{backup_uplink['leaf_vm']!r}; expected ns-leaf-<index>"
+            )
         result.update(
             {
                 "backup_guest_mac": backup_uplink["guest_mac"],
+                "backup_leaf": backup_uplink["leaf_vm"],
+                "backup_leaf_index": int(leaf_match.group(1)),
                 "backup_leaf_port": backup_uplink["leaf_port"],
                 "backup_server_port": backup_port,
             }

@@ -290,7 +290,7 @@
       register: _vmaas_evpn_cudns_raw
       changed_when: false
 
-    - name: Read each expected EVPN BGP session state
+    - name: Read every expected EVPN BGP session state in one snapshot
       ansible.builtin.command:
         argv:
           - oc
@@ -298,18 +298,18 @@
           - bgpsessionstates.frrk8s.metallb.io
           - --all-namespaces
           - --selector
-          - "frrk8s.metallb.io/peer={{ item }}"
+          - "frrk8s.metallb.io/node={{ _vmaas_node_name }},frrk8s.metallb.io/peer in ({{ _vmaas_peer_ids | join(',') }})"
           - -o
           - json
       register: _vmaas_bgp_sessions_raw
       until: >-
         _vmaas_bgp_sessions_raw.rc == 0 and
-        ((_vmaas_bgp_sessions_raw.stdout | from_json)['items'] | default([])
-         | selectattr('status.bgpStatus', 'equalto', 'Established') | list | length) > 0
+        (((_vmaas_bgp_sessions_raw.stdout | from_json)['items'] | default([])
+          | selectattr('status.bgpStatus', 'equalto', 'Established') | list | length)
+         == (_vmaas_expected_neighbor_count | int))
       retries: 60
       delay: 10
       changed_when: false
-      loop: "{{ _vmaas_peer_ids }}"
 
     - name: Parse Task 3 EVPN readiness resources
       ansible.builtin.set_fact:
@@ -319,8 +319,9 @@
         _vmaas_evpn_frr: "{{ _vmaas_evpn_frr_raw.stdout | from_json }}"
         _vmaas_route_advertisements: "{{ _vmaas_route_advertisements_raw.stdout | from_json }}"
         _vmaas_evpn_cudns: "{{ _vmaas_evpn_cudns_raw.stdout | from_json }}"
-        _vmaas_bgp_sessions: "{{ _vmaas_bgp_sessions_raw.results | default([]) }}"
+        _vmaas_bgp_sessions: "{{ _vmaas_bgp_sessions_raw.stdout | from_json }}"
         _vmaas_evpn_raw: "{{ (_vmaas_evpn_frr_raw.stdout | from_json).spec.raw.rawConfig | default('') }}"
+        _vmaas_node_asn: "{{ (((_vmaas_frr_raw.stdout | from_json).get('spec', {}).get('bgp', {}).get('routers', []) | first | default({})).get('asn', 0) | int) }}"
 
     - name: Require the underlay NNCP to be Available
       ansible.builtin.assert:
@@ -414,13 +415,36 @@
           - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-ACTIVE-OUT out') in _vmaas_evpn_raw"
           - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-IN in') in _vmaas_evpn_raw"
           - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-OUT out') in _vmaas_evpn_raw"
+          - >-
+            (_vmaas_evpn_raw is search('(?s)route-map '
+             ~ (_vmaas_peer_ids[0] | regex_escape)
+             ~ '-in permit 1\s+description EVPN active uplink IPv4 unicast inbound'
+             ~ '\s+match ip address prefix-list EVPN-REMOTE-VTEPS\s+set local-preference 200\\b'))
+          - >-
+            (_vmaas_evpn_raw is search('(?s)route-map '
+             ~ (_vmaas_peer_ids[1] | regex_escape)
+             ~ '-in permit 1\s+description EVPN backup uplink IPv4 unicast inbound'
+             ~ '\s+match ip address prefix-list EVPN-REMOTE-VTEPS\s+set local-preference 100\\b'))
+          - >-
+            (_vmaas_evpn_raw is search('(?s)route-map '
+             ~ (_vmaas_peer_ids[1] | regex_escape)
+             ~ '-out permit 1\s+description EVPN backup uplink IPv4 unicast outbound'
+             ~ '\s+match ip address prefix-list ' ~ (_vmaas_peer_ids[1] | regex_escape) ~ '-allowed-ipv4'
+             ~ '\s+set as-path prepend ' ~ (_vmaas_node_asn | string) ~ ' '
+             ~ (_vmaas_node_asn | string) ~ ' ' ~ (_vmaas_node_asn | string) ~ '\\b'))
+          - >-
+            (_vmaas_evpn_raw is search('(?s)route-map EVPN-ACTIVE-IN permit 10\s+description EVPN active uplink inbound\s+set local-preference 200\\b'))
+          - >-
+            (_vmaas_evpn_raw is search('(?s)route-map EVPN-BACKUP-OUT permit 10\s+description EVPN backup uplink outbound\s+set as-path prepend '
+             ~ (_vmaas_node_asn | string) ~ ' ' ~ (_vmaas_node_asn | string) ~ ' '
+             ~ (_vmaas_node_asn | string) ~ '\\b'))
           - (_vmaas_frr_neighbors[1].asn | int) == ((_vmaas_frr_neighbors[0].asn | int) + ((ocp_evpn_backup_leaf_index | int) - (ocp_underlay_leaf_index | int)))
         fail_msg: >-
           ocp_evpn_bgp_active_backup is enabled but the host EVPN rawConfig
-          does not merge the active/backup IPv4 local-preference entries into
-          the frr-k8s generated route-maps, does not apply the L2VPN EVPN
-          route-maps to {{ _vmaas_peer_ids | join(' (active) / ') }}, or the
-          backup neighbor ASN does not match its leaf index.
+          does not merge the active/backup IPv4 local-preference and prepend
+          bodies into the frr-k8s generated route-maps, does not apply the
+          L2VPN EVPN route-maps to {{ _vmaas_peer_ids | join(' (active) / ') }},
+          or the backup neighbor ASN does not match its leaf index.
       when: _vmaas_active_backup | bool
 
     - name: Require the unnumbered IPv4 unicast policy to stay with frr-k8s
@@ -449,14 +473,10 @@
     - name: Require every expected EVPN underlay BGP session to be Established
       ansible.builtin.assert:
         that:
-          - (_vmaas_bgp_sessions | length) == (_vmaas_expected_neighbor_count | int)
           - >-
-            (_vmaas_bgp_sessions
-             | selectattr('stdout', 'defined')
-             | map(attribute='stdout') | map('from_json')
-             | map(attribute='items') | flatten
-             | selectattr('status.bgpStatus', 'equalto', 'Established')
-             | list | length) >= (_vmaas_expected_neighbor_count | int)
+            ((_vmaas_bgp_sessions['items'] | default([])
+              | selectattr('status.bgpStatus', 'equalto', 'Established') | list | length)
+             == (_vmaas_expected_neighbor_count | int))
         fail_msg: >-
           Expected an Established BGPSessionState for every EVPN underlay peer
           {{ _vmaas_peer_ids | join(', ') }}.
