@@ -40,7 +40,7 @@ evpn:
           peerASN: {{ _ocp_evpn_leaf_asn | int }}
 {% endif %}
 {% if ocp_evpn_bgp_active_backup | default(false) | bool %}
-        - interface: {{ ocp_evpn_backup_interface | to_json }}
+        - interface: {{ ocp_evpn_backup_guest_interface | to_json }}
           role: backup
 {% if ocp_evpn_bgp_unnumbered | default(false) | bool %}
           unnumbered: true

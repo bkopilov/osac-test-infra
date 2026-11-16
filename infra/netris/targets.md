@@ -390,7 +390,7 @@ catalog and `all.yml` list different keys.
 | `ocp_evpn_vtep_dummy_interface` | `evpn-vtep0` | `configure-cudn-evpn` |
 | `ocp_evpn_bgp_active_active` | `false` | `configure-cudn-evpn` |
 | `ocp_evpn_bgp_active_backup` | `false` | `configure-cudn-evpn`, `netris-lab topology` |
-| `ocp_evpn_backup_interface` | `eth12` | `configure-cudn-evpn`, `netris-lab topology` |
+| `ocp_evpn_backup_server_port` | `eth12` | `configure-netris`, `configure-cudn-evpn`, `netris-lab topology` |
 | `ocp_evpn_backup_leaf_port` | `swp1s2` | `netris-lab topology` |
 | `ocp_evpn_backup_leaf_index` | `0` | `configure-cudn-evpn`, `netris-lab topology` |
 | `ocp_evpn_backup_p2p_cidr` | `192.0.3.0/30` | `configure-cudn-evpn`, `netris-lab topology` |

@@ -288,22 +288,34 @@ Unnumbered BGP is also opt-in. Set `ocp_evpn_bgp_unnumbered=true` when running
 configures FRR to peer by the local interface name. The matching fabric port
 must already support unnumbered BGP and provide the required link-local
 underlay. Leave this setting false for the existing numbered `/31` contract.
+For unnumbered neighbors the installer also attaches its own `EVPN-IPV4-IN`
+and `EVPN-IPV4-OUT` route-maps to the `address-family ipv4 unicast` neighbor,
+so IPv4 next hops are resolved from the learned IPv6 link-local address
+without being filtered. frr-k8s still generates its
+`<peer>-allowed-ipv6`/`<peer>-inpl-dual` deny prefix-lists; leave them in
+place, they are never evaluated for those IPv4 unicast routes.
 
 Active/backup EVPN uplinks are opt-in and mutually exclusive with
 `ocp_evpn_bgp_active_active`. Set `ocp_evpn_bgp_active_backup=true` and point
 the backup link at a second underlay-enabled port on a different leaf:
-`ocp_evpn_backup_interface` (`eth12`), `ocp_evpn_backup_leaf_port` (`swp1s2`),
+`ocp_evpn_backup_server_port` (`eth12`), `ocp_evpn_backup_leaf_port` (`swp1s2`),
 `ocp_evpn_backup_leaf_index` (`0`) and `ocp_evpn_backup_p2p_cidr`
 (`192.0.3.0/30`, leaf `.1`, OCP `.2`). The generated
 `.evpn-values.yaml` sets `activeBackup: true` and tags the primary uplink
 `active` and the backup uplink `backup`, so the installer renders
 `local-preference 200` on the active peer and `local-preference 100` plus a
 triple AS-path prepend on the backup peer. IPv4 unicast still accepts only the
-reserved VTEP loopbacks through the generated prefix list, while the L2VPN EVPN
-address family stays unfiltered. Unnumbered BGP applies to both uplinks when it
-is enabled. When the mode is enabled, `deploy-infra` also wires `eth12` to
+reserved VTEP loopbacks through the installer's `EVPN-IPV4-ACTIVE-*` and
+`EVPN-IPV4-BACKUP-*` prefix lists, while the L2VPN EVPN address family stays
+unfiltered. Unnumbered BGP applies to both uplinks when it is enabled, and the
+route-maps are attached to each neighbor in `address-family ipv4 unicast`, so
+frr-k8s's generated IPv6 deny prefix-lists stay in place without blocking the
+IPv6 link-local next hop. When the mode is enabled, `deploy-infra` also wires `eth12` to
 `ns-leaf-0 swp1s2` with underlay enabled and moves h02's leaf-0 link to
-`swp2s0`; the default single-uplink topology is unchanged.
+`swp2s0`; the default single-uplink topology is unchanged. The role resolves
+the backup guest Linux interface name from the Netris port's MAC, just like
+the data and primary underlay interfaces, so the generated values do not
+depend on guest NIC enumeration.
 
 Netris/CUDN EVPN settings are overlays inside the existing OSAC service profile
 directories: `osac-installer/values/vmaas-ci/netris.yaml`,

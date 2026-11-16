@@ -211,7 +211,7 @@ resource "netris_link" "north-south-leaf-to-hgx-h00-backup" {
   count                           = var.north-south-fabric.enable
   ports                           = [
                                       "{{ ocp_evpn_backup_leaf_port }}@${netris_switch.north-south-leaf[{{ ocp_evpn_backup_leaf_index | int }}].name}",
-                                      "{{ ocp_evpn_backup_interface }}@${netris_server.hgx[0].name}"
+                                      "{{ ocp_evpn_backup_server_port }}@${netris_server.hgx[0].name}"
   ]
   ipv4                            = [
                                       "{{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('1') }}",

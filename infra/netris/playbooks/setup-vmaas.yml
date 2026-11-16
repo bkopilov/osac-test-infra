@@ -186,10 +186,18 @@
           provisioned and acknowledged. This check does not mutate or verify
           external Netris/ISP policy; BGP peer state is checked below.
 
-    - name: Derive the expected Netris leaf peer from the configured OCP /31
+    - name: Derive the expected EVPN underlay peers from the configured networks
       ansible.builtin.set_fact:
         _vmaas_leaf_peer_ip: >-
           {{ ocp_underlay_p2p_cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}
+        _vmaas_backup_leaf_peer_ip: >-
+          {{ ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}
+        _vmaas_active_backup: "{{ ocp_evpn_bgp_active_backup | default(false) | bool }}"
+        _vmaas_unnumbered: "{{ ocp_evpn_bgp_unnumbered | default(false) | bool }}"
+        _vmaas_expected_neighbor_count: "{{ 2 if (ocp_evpn_bgp_active_backup | default(false) | bool) else 1 }}"
+        _vmaas_expected_peer_ips: >-
+          {{ [_vmaas_leaf_peer_ip]
+             + ([_vmaas_backup_leaf_peer_ip] if (ocp_evpn_bgp_active_backup | default(false) | bool) else []) }}
 
     - name: Read the single-node underlay NNCP
       ansible.builtin.command:
@@ -236,6 +244,17 @@
       register: _vmaas_frr_raw
       changed_when: false
 
+    - name: Derive EVPN neighbor identities from the FRRConfiguration
+      ansible.builtin.set_fact:
+        _vmaas_frr_neighbors: >-
+          {{ (_vmaas_frr_raw.stdout | from_json).spec.bgp.routers[0].neighbors | default([]) }}
+        _vmaas_peer_ids: >-
+          {{ ((_vmaas_frr_raw.stdout | from_json).spec.bgp.routers[0].neighbors | default([])
+              | map(attribute='interface') | list)
+             if (ocp_evpn_bgp_unnumbered | default(false) | bool)
+             else ((_vmaas_frr_raw.stdout | from_json).spec.bgp.routers[0].neighbors | default([])
+              | map(attribute='address') | list) }}
+
     - name: Read the OCP host EVPN address-family configuration
       ansible.builtin.command:
         argv:
@@ -268,7 +287,7 @@
       register: _vmaas_evpn_cudns_raw
       changed_when: false
 
-    - name: Read the selected BGP session state
+    - name: Read each expected EVPN BGP session state
       ansible.builtin.command:
         argv:
           - oc
@@ -276,7 +295,7 @@
           - bgpsessionstates.frrk8s.metallb.io
           - --all-namespaces
           - --selector
-          - "frrk8s.metallb.io/peer={{ _vmaas_leaf_peer_ip }}"
+          - "frrk8s.metallb.io/peer={{ item }}"
           - -o
           - json
       register: _vmaas_bgp_sessions_raw
@@ -287,6 +306,7 @@
       retries: 60
       delay: 10
       changed_when: false
+      loop: "{{ _vmaas_peer_ids }}"
 
     - name: Parse Task 3 EVPN readiness resources
       ansible.builtin.set_fact:
@@ -296,7 +316,8 @@
         _vmaas_evpn_frr: "{{ _vmaas_evpn_frr_raw.stdout | from_json }}"
         _vmaas_route_advertisements: "{{ _vmaas_route_advertisements_raw.stdout | from_json }}"
         _vmaas_evpn_cudns: "{{ _vmaas_evpn_cudns_raw.stdout | from_json }}"
-        _vmaas_bgp_sessions: "{{ _vmaas_bgp_sessions_raw.stdout | from_json }}"
+        _vmaas_bgp_sessions: "{{ _vmaas_bgp_sessions_raw.results | default([]) }}"
+        _vmaas_evpn_raw: "{{ (_vmaas_evpn_frr_raw.stdout | from_json).spec.raw.rawConfig | default('') }}"
 
     - name: Require the underlay NNCP to be Available
       ansible.builtin.assert:
@@ -317,41 +338,124 @@
              | selectattr('reason', 'equalto', 'Allocated') | list | length) > 0
         fail_msg: "VTEP tenant-vtep is not Accepted=True/Allocated."
 
-    - name: Require a default-VRF FRR peer for the selected leaf
+    - name: Require the default-VRF EVPN underlay neighbors
       ansible.builtin.assert:
         that:
           - _vmaas_frr.metadata.labels.evpn | default('') == 'true'
           - _vmaas_frr.spec.bgp.routers | length == 1
           - _vmaas_frr.spec.bgp.routers[0].vrf | default('') == ''
-          - _vmaas_frr.spec.bgp.routers[0].neighbors | length == 1
-          - _vmaas_frr.spec.bgp.routers[0].neighbors[0].address == _vmaas_leaf_peer_ip
+          - _vmaas_frr_neighbors | length == (_vmaas_expected_neighbor_count | int)
+          - (_vmaas_peer_ids | unique | list | length) == (_vmaas_expected_neighbor_count | int)
+          - (_vmaas_unnumbered | bool) or
+            ((_vmaas_peer_ids | sort) == (_vmaas_expected_peer_ips | sort))
+          - (not (_vmaas_unnumbered | bool)) or
+            ((_vmaas_frr_neighbors | selectattr('address', 'defined') | list | length) == 0)
         fail_msg: >-
           FRRConfiguration osac-evpn-{{ _vmaas_node_name }} must have the
-          evpn=true label and one default-VRF neighbor matching the leaf
-          endpoint {{ _vmaas_leaf_peer_ip }}.
+          evpn=true label and {{ _vmaas_expected_neighbor_count }} default-VRF
+          neighbor(s). Expected numbered peers
+          {{ _vmaas_expected_peer_ips | join(', ') }}, or interface-based
+          peers for unnumbered mode. Observed neighbors={{ _vmaas_frr_neighbors | to_json }}.
 
     - name: Require the OCP host EVPN address family
       ansible.builtin.assert:
         that:
           - _vmaas_evpn_frr.spec.raw.priority | int == 5
           - _vmaas_evpn_frr.spec.nodeSelector.matchLabels['kubernetes.io/hostname'] | length > 0
-          - "'address-family l2vpn evpn' in (_vmaas_evpn_frr.spec.raw.rawConfig | default(''))"
-          - "('neighbor ' ~ _vmaas_leaf_peer_ip ~ ' activate') in (_vmaas_evpn_frr.spec.raw.rawConfig | default(''))"
-          - "'allowas-in origin' in (_vmaas_evpn_frr.spec.raw.rawConfig | default(''))"
-          - "'advertise-all-vni' in (_vmaas_evpn_frr.spec.raw.rawConfig | default(''))"
+          - "'address-family l2vpn evpn' in _vmaas_evpn_raw"
+          - "'allowas-in origin' in _vmaas_evpn_raw"
+          - "'advertise-all-vni' in _vmaas_evpn_raw"
         fail_msg: >-
           FRRConfiguration osac-evpn-raw-{{ _vmaas_node_name }} must configure
-          the selected leaf {{ _vmaas_leaf_peer_ip }} in the host L2VPN EVPN address family with
-          allowas-in origin and advertise-all-vni.
+          the host L2VPN EVPN address family with allowas-in origin and
+          advertise-all-vni.
 
-    - name: Require the OCP-to-Netris BGP session to be Established
+    - name: Require every EVPN underlay neighbor in the host L2VPN EVPN address family
       ansible.builtin.assert:
         that:
-          - >-
-            (_vmaas_bgp_sessions["items"] | default([])
-             | selectattr('status.bgpStatus', 'equalto', 'Established') | list | length) > 0
+          - "('neighbor ' ~ item ~ ' activate') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ item ~ ' allowas-in origin') in _vmaas_evpn_raw"
         fail_msg: >-
-          No BGPSessionState selected by peer {{ _vmaas_leaf_peer_ip }} is Established.
+          FRRConfiguration osac-evpn-raw-{{ _vmaas_node_name }} must activate
+          neighbor {{ item }} with allowas-in origin in the L2VPN EVPN
+          address family.
+      loop: "{{ _vmaas_peer_ids }}"
+
+    - name: Require each unnumbered EVPN neighbor in the node NNCP
+      ansible.builtin.assert:
+        that:
+          - item in (_vmaas_nncp.spec.desiredState.interfaces | map(attribute='name') | list)
+        fail_msg: >-
+          NNCP osac-evpn-{{ _vmaas_node_name }} does not configure the
+          unnumbered neighbor interface {{ item }}.
+      loop: "{{ _vmaas_peer_ids }}"
+      when: _vmaas_unnumbered | bool
+
+    - name: Require the active-active multipath EVPN policy
+      ansible.builtin.assert:
+        that:
+          - "'bgp bestpath as-path multipath-relax' in _vmaas_evpn_raw"
+          - "'maximum-paths 16' in _vmaas_evpn_raw"
+        fail_msg: >-
+          ocp_evpn_bgp_active_active is enabled but the host EVPN rawConfig
+          does not enable as-path multipath-relax and maximum-paths 16.
+      when: ocp_evpn_bgp_active_active | default(false) | bool
+
+    - name: Require the active-backup EVPN neighbor policy
+      ansible.builtin.assert:
+        that:
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-ACTIVE-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-ACTIVE-OUT out') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-IPV4-BACKUP-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-IPV4-BACKUP-OUT out') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-ACTIVE-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[1] ~ ' route-map EVPN-BACKUP-OUT out') in _vmaas_evpn_raw"
+          - (_vmaas_frr_neighbors[1].asn | int) == ((_vmaas_frr_neighbors[0].asn | int) + ((ocp_evpn_backup_leaf_index | int) - (ocp_underlay_leaf_index | int)))
+        fail_msg: >-
+          ocp_evpn_bgp_active_backup is enabled but the host EVPN rawConfig
+          does not apply the active/backup IPv4 and L2VPN EVPN route-maps to
+          {{ _vmaas_peer_ids | join(' (active) / ') }}, or the backup neighbor
+          ASN does not match its leaf index.
+      when: _vmaas_active_backup | bool
+
+    - name: Require the unnumbered IPv4 unicast route-maps
+      ansible.builtin.assert:
+        that:
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-IN in') in _vmaas_evpn_raw"
+          - "('neighbor ' ~ _vmaas_peer_ids[0] ~ ' route-map EVPN-IPV4-OUT out') in _vmaas_evpn_raw"
+        fail_msg: >-
+          An unnumbered EVPN neighbor must use the chart-owned IPv4 unicast
+          route-maps so IPv6 link-local next hops are never evaluated against
+          the frr-k8s-generated IPv6 prefix-lists.
+      when:
+        - _vmaas_unnumbered | bool
+        - not (_vmaas_active_backup | bool)
+
+    - name: Require the configured EVPN BFD profile
+      ansible.builtin.assert:
+        that:
+          - (_vmaas_frr.spec.bgp.bfdProfiles | default([]) | length) > 0
+          - (_vmaas_frr.spec.bgp.bfdProfiles[0].name | default('')) == (ocp_evpn_bfd_profile | trim)
+        fail_msg: >-
+          ocp_evpn_bfd_profile is set but the FRRConfiguration does not carry
+          that BFD profile.
+      when: (ocp_evpn_bfd_profile | default('') | trim | length) > 0
+
+    - name: Require every expected EVPN underlay BGP session to be Established
+      ansible.builtin.assert:
+        that:
+          - (_vmaas_bgp_sessions | length) == (_vmaas_expected_neighbor_count | int)
+          - >-
+            (_vmaas_bgp_sessions
+             | selectattr('stdout', 'defined')
+             | map(attribute='stdout') | map('from_json')
+             | map(attribute='items') | flatten
+             | selectattr('status.bgpStatus', 'equalto', 'Established')
+             | list | length) >= (_vmaas_expected_neighbor_count | int)
+        fail_msg: >-
+          Expected an Established BGPSessionState for every EVPN underlay peer
+          {{ _vmaas_peer_ids | join(', ') }}.
 
     - name: Require accepted PodNetwork RouteAdvertisements when an EVPN CUDN exists
       ansible.builtin.assert:

@@ -272,6 +272,20 @@ def resolve(args: argparse.Namespace) -> dict:
         if underlay_uplink["underlay"] != "enabled":
             raise UplinkError(f"Configured Netris underlay port {underlay_port} is not enabled for underlay")
 
+    backup_port = ""
+    backup_uplink = None
+    if args.backup_server_port:
+        if not re.fullmatch(r"eth\d+", args.backup_server_port):
+            raise UplinkError(f"Invalid Netris backup server port: {args.backup_server_port!r}")
+        backup_port = f"{args.backup_server_port}@{vm}"
+        backup_uplink = uplinks.get(backup_port)
+        if backup_uplink is None:
+            raise UplinkError(f"Configured Netris backup port {backup_port} has no verified leaf/tunnel mapping")
+        if backup_uplink["underlay"] != "enabled":
+            raise UplinkError(f"Configured Netris backup port {backup_port} is not enabled for underlay")
+        if backup_port == underlay_port:
+            raise UplinkError(f"Netris backup port {backup_port} must differ from the primary underlay port")
+
     vnets = api_list(args.controller_url, "/api/v2/vnet")
     matches = [item for item in vnets if item.get("name") == args.vnet_name]
     if len(matches) > 1:
@@ -321,6 +335,14 @@ def resolve(args: argparse.Namespace) -> dict:
                 "underlay_guest_mac": underlay_uplink["guest_mac"],
                 "underlay_leaf_port": underlay_uplink["leaf_port"],
                 "underlay_server_port": underlay_port,
+            }
+        )
+    if backup_uplink is not None:
+        result.update(
+            {
+                "backup_guest_mac": backup_uplink["guest_mac"],
+                "backup_leaf_port": backup_uplink["leaf_port"],
+                "backup_server_port": backup_port,
             }
         )
     return result
@@ -484,6 +506,7 @@ def main() -> int:
     resolver.add_argument("--aliases-path", default="/root/.cloudsim_aliases")
     resolver.add_argument("--vm-mgmt-ip", default="")
     resolver.add_argument("--underlay-server-port", default="")
+    resolver.add_argument("--backup-server-port", default="")
     reconciler = subparsers.add_parser("reconcile")
     reconciler.add_argument("--controller-url", required=True)
     reconciler.add_argument("--vnet-name", required=True)

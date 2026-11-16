@@ -249,28 +249,38 @@
           - ocp_uplink_mac is defined
           - ocp_underlay_uplink_mac | default('') | length == 17
           - (ocp_uplink_mac | lower) != (ocp_underlay_uplink_mac | lower)
+          - (not (ocp_evpn_bgp_active_backup | default(false) | bool)) or
+            ((ocp_evpn_backup_guest_mac | default('') | length) == 17)
+          - (not (ocp_evpn_bgp_active_backup | default(false) | bool)) or
+            ((ocp_evpn_backup_guest_mac | lower) != (ocp_uplink_mac | lower))
+          - (not (ocp_evpn_bgp_active_backup | default(false) | bool)) or
+            ((ocp_evpn_backup_guest_mac | lower) != (ocp_underlay_uplink_mac | lower))
           - ocp_vm_mgmt_ip_resolved is defined
         fail_msg: >-
-          Netris data and underlay link MACs must be verified before resolving
-          Linux interfaces on h00. No cluster configuration was changed.
+          Netris data, underlay, and active-backup link MACs must be verified
+          and distinct before resolving Linux interfaces on h00.
+          No cluster configuration was changed.
       tags: [cudn_evpn]
 
     - name: Resolve h00 data and underlay interfaces from their MAC addresses
       ansible.builtin.command:
-        argv:
-          - "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
-          - "{{ playbook_dir }}/../scripts/ocp_uplink.py"
-          - interfaces
-          - --vm-mgmt-ip
-          - "{{ ocp_vm_mgmt_ip_resolved }}"
-          - --management-address
-          - "{{ ocp_vm_mgmt_ip_resolved }}"
-          - --host-key
-          - "{{ snapshot_flavor_dir }}/crypto/cluster-tool.key"
-          - --mac
-          - "{{ ocp_uplink_mac }}"
-          - --mac
-          - "{{ ocp_underlay_uplink_mac }}"
+        argv: >-
+          {{
+            [
+              ansible_python_interpreter | default('/usr/bin/python3'),
+              playbook_dir ~ '/../scripts/ocp_uplink.py',
+              'interfaces',
+              '--vm-mgmt-ip', ocp_vm_mgmt_ip_resolved,
+              '--management-address', ocp_vm_mgmt_ip_resolved,
+              '--host-key', snapshot_flavor_dir ~ '/crypto/cluster-tool.key',
+              '--mac', ocp_uplink_mac,
+              '--mac', ocp_underlay_uplink_mac
+            ]
+            + (
+              ['--mac', ocp_evpn_backup_guest_mac]
+              if ocp_evpn_bgp_active_backup | default(false) | bool else []
+            )
+          }}
       register: _ocp_evpn_interfaces_raw
       changed_when: false
       failed_when: false
@@ -294,6 +304,9 @@
           {{ (_ocp_evpn_interfaces_raw.stdout | from_json).interfaces[ocp_underlay_uplink_mac | lower] }}
         ocp_underlay_management_interface: >-
           {{ (_ocp_evpn_interfaces_raw.stdout | from_json).management_interface }}
+        ocp_evpn_backup_guest_interface: >-
+          {{ (_ocp_evpn_interfaces_raw.stdout | from_json).interfaces[ocp_evpn_backup_guest_mac | lower]
+             if ocp_evpn_bgp_active_backup | default(false) | bool else '' }}
       tags: [cudn_evpn]
 
     - name: Require distinct, valid data, underlay, and management interfaces
@@ -321,6 +334,8 @@
           - ocp_evpn_vtep_dummy_interface | trim == 'evpn-vtep0'
           - ocp_evpn_vtep_dummy_interface | trim != ocp_underlay_guest_interface | trim
           - ocp_evpn_vtep_dummy_interface | trim != ocp_underlay_management_interface | trim
+          - (not (ocp_evpn_bgp_active_backup | default(false) | bool)) or
+            (ocp_evpn_vtep_dummy_interface | trim != ocp_evpn_backup_guest_interface | trim)
         fail_msg: >-
           ocp_evpn_vtep_dummy_interface must be evpn-vtep0, as required by the
           installer, and distinct from the confirmed fabric and management
@@ -329,6 +344,23 @@
           fabric={{ ocp_underlay_guest_interface }},
           management={{ ocp_underlay_management_interface }}.
           No cluster configuration was changed.
+      tags: [cudn_evpn]
+
+    - name: Require a distinct, valid active-backup guest interface
+      ansible.builtin.assert:
+        that:
+          - ocp_evpn_backup_guest_interface is match('^[A-Za-z0-9_.:-]{1,15}$')
+          - ocp_evpn_backup_guest_interface is not match('^(br-|ovn-|genev_)')
+          - ocp_evpn_backup_guest_interface not in ['lo', 'br-ex', 'br-int']
+          - ocp_evpn_backup_guest_interface != ocp_data_guest_interface
+          - ocp_evpn_backup_guest_interface != ocp_underlay_guest_interface
+          - ocp_evpn_backup_guest_interface != ocp_underlay_management_interface
+        fail_msg: >-
+          The active-backup Netris port {{ ocp_evpn_backup_server_port }} must
+          resolve to a distinct physical guest interface; got
+          {{ ocp_evpn_backup_guest_interface }}.
+          No cluster configuration was changed.
+      when: ocp_evpn_bgp_active_backup | default(false) | bool
       tags: [cudn_evpn]
 
     - name: Validate the OCP-to-Netris point-to-point network
@@ -425,13 +457,8 @@
     - name: Validate the active-backup EVPN uplink
       ansible.builtin.assert:
         that:
-          - ocp_evpn_backup_interface is match('^[A-Za-z0-9_.:-]{1,15}$')
-          - ocp_evpn_backup_interface is not match('^(br-|ovn-|genev_)')
-          - ocp_evpn_backup_interface not in ['lo', 'br-ex', 'br-int']
-          - ocp_evpn_backup_interface != ocp_underlay_guest_interface
-          - ocp_evpn_backup_interface != ocp_underlay_management_interface
-          - ocp_evpn_backup_interface != ocp_data_guest_interface
-          - ocp_evpn_backup_interface != ocp_evpn_vtep_dummy_interface
+          - ocp_evpn_backup_server_port is match('^eth[0-9]+$')
+          - ocp_evpn_backup_server_port != ocp_underlay_server_port
           - ocp_evpn_backup_leaf_port is match('^swp[0-9]+s[0-9]+$')
           - ocp_evpn_backup_p2p_cidr | ansible.utils.ipv4('net') | default('', true) | length > 0
           - ocp_evpn_backup_p2p_cidr | ansible.utils.ipaddr('prefix') | int == 30
@@ -451,7 +478,8 @@
           The active-backup uplink needs a distinct IPv4 /30 peer network on a
           second underlay-enabled port whose leaf differs from the active leaf,
           and it must not overlap the active /31 or the reserved VTEP range.
-          Observed interface={{ ocp_evpn_backup_interface }},
+          Observed Netris port={{ ocp_evpn_backup_server_port }},
+          guest interface={{ ocp_evpn_backup_guest_interface }},
           network={{ ocp_evpn_backup_p2p_cidr }},
           leaf index={{ ocp_evpn_backup_leaf_index }},
           leaf ASN={{ _ocp_evpn_backup_leaf_asn }}.

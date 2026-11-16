@@ -317,7 +317,9 @@ ocp_evpn_bgp_active_active: false
 # egress. The netris-lab topology wires the backup link (a second
 # underlay-enabled port on another leaf) only when this is enabled.
 ocp_evpn_bgp_active_backup: false
-ocp_evpn_backup_interface: "eth12"
+# Netris server port name for the dedicated backup underlay. The role resolves
+# the guest Linux interface name from this port's MAC before rendering values.
+ocp_evpn_backup_server_port: "eth12"
 ocp_evpn_backup_leaf_port: "swp1s2"
 ocp_evpn_backup_leaf_index: 0
 ocp_evpn_backup_p2p_cidr: "192.0.3.0/30"
