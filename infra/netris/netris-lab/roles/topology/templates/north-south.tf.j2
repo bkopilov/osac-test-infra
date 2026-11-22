@@ -199,8 +199,9 @@ resource "netris_link" "north-south-leaf-to-gpu-server" {
 }
 
 # The underlay peer is generated from the Netris-managed eth10 <-> swp1s0
-# link (underlay = enabled) and the EVPN-VTEP server ASN above. Do not create
-# a separate VLAN-backed netris_bgp resource on this routed point-to-point link.
+# link (underlay = enabled) and the Generic-role unmanaged VTEP server ASN
+# above. Do not create a separate VLAN-backed netris_bgp resource on this
+# routed point-to-point link.
 
 
 #Leaf to Spine links
